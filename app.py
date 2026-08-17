@@ -238,7 +238,7 @@ def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_dat
 
 def batch_worker(chap_keys_list, api_keys, model_choice, novel_data_dict, trans_status_dict, delay_time, user_email):
     st.session_state.worker_running = True
-    batch_size = 3  # Dịch 3 chương cùng lúc
+    batch_size = 3  
     
     keys_to_translate = [
         k for k in chap_keys_list 
@@ -341,12 +341,12 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
     
     with tab1:
         st.subheader("Cào Raw từ nhiều Website (Bao gồm Zhihu)")
-        st.info("💡 Mỗi link cào thành công sẽ được lưu thành **1 file .txt độc lập riêng biệt** trong danh sách quản lý file phía dưới.")
+        st.info("💡 Mỗi link cào thành công sẽ được lưu thành 1 file riêng. Bạn có thể đổi tên và tải về ngay bên dưới!")
         
         urls_input = st.text_area("Nhập danh sách Link (mỗi link 1 dòng):", height=150)
         
         with st.expander("⚙️ (Tùy chọn) Nhập Cookie cho Zhihu trả phí"):
-            custom_cookie = st.text_area("Dán Cookie Zhihu vào đây:", help="Nếu là bài Zhihu trả phí, bạn cần f12 lấy Cookie dán vào đây.")
+            custom_cookie = st.text_area("Dán Cookie Zhihu vào đây:", help="Dùng Cookie-Editor chọn dạng JSON và dán vào đây.")
             
         if st.button("🕷️ Bắt đầu cào & Lưu thành các File riêng lẻ", use_container_width=True):
             if urls_input.strip():
@@ -381,13 +381,41 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
                             
                 if success_count > 0:
                     save_user_data_to_supabase()
-                    st.success(f"🎉 Đã cào thành công {success_count} link và tạo ra {success_count} file .txt độc lập!")
-                    st.info("👉 Hãy qua tab '📂 Quản Lý File Raw & Tách Chương' để chọn từng file tách chương nhé!")
-                    time.sleep(2)
-                    st.rerun()
+                    st.success(f"🎉 Đã cào thành công {success_count} link!")
             else:
                 st.warning("Vui lòng nhập ít nhất 1 link.")
-                
+
+        # ==========================================
+        # TÍNH NĂNG MỚI: ĐỔI TÊN VÀ TẢI FILE VỀ MÁY TÍNH
+        # ==========================================
+        if st.session_state.novel_data.get("raw_docs"):
+            st.write("---")
+            st.subheader("📥 Quản lý & Tải file đã cào về máy")
+            
+            for i, doc in enumerate(st.session_state.novel_data["raw_docs"]):
+                with st.container(border=True):
+                    col_name, col_btn = st.columns([3, 1])
+                    with col_name:
+                        # Ô nhập văn bản để đổi tên file
+                        new_name = st.text_input(f"Tên file {i+1}:", value=doc["filename"], key=f"rename_{i}")
+                        # Tự động lưu tên mới nếu bạn chỉnh sửa
+                        if new_name != doc["filename"]:
+                            st.session_state.novel_data["raw_docs"][i]["filename"] = new_name
+                            save_user_data_to_supabase()
+                    
+                    with col_btn:
+                        st.write("") # Căn chỉnh lề cho đẹp
+                        st.write("")
+                        # Nút bấm để tải về ổ cứng
+                        st.download_button(
+                            label="💾 Tải về máy",
+                            data=doc["content"],
+                            file_name=new_name if new_name.endswith('.txt') else f"{new_name}.txt",
+                            mime="text/plain",
+                            key=f"dl_btn_{i}",
+                            use_container_width=True
+                        )
+
     with tab2:
         st.subheader("📂 Tải lên hoặc Quản Lý File Raw (.txt)")
         uploaded_file = st.file_uploader("Tải lên file tiểu thuyết tiếng Trung (.txt)", type=["txt"], key="txt_uploader")
@@ -504,14 +532,14 @@ elif menu == "3. Dịch & Quản Lý":
         st.subheader("📖 Xem & Chỉnh sửa bản dịch")
         
         # Tạo danh sách để hiển thị trong selectbox (Có đính kèm trạng thái)
-        options = [f"{k}  ---  ({st.session_state.trans_status[k]})" for k in chap_keys]
+        options = [f"{k}   ---   ({st.session_state.trans_status[k]})" for k in chap_keys]
         
         # Dropdown chọn 1 chương duy nhất để tập trung hiển thị
         selected_option = st.selectbox("Chọn chương muốn xem:", options)
         
         if selected_option:
             # Lấy lại tên gốc của chương
-            selected_key = selected_option.split("  ---  ")[0]
+            selected_key = selected_option.split("   ---   ")[0]
             
             # Nút dịch lại riêng cho chương đang được chọn
             if st.button(f"✨ Bấm để Dịch chương này", key=f"btn_{selected_key}"):
