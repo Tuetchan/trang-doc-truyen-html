@@ -341,7 +341,7 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
     
     with tab1:
         st.subheader("Cào Raw từ nhiều Website (Bao gồm Zhihu)")
-        st.info("💡 Mỗi link cào thành công sẽ được lưu thành 1 file riêng. Bạn có thể đổi tên và tải về ngay bên dưới!")
+        st.info("💡 Mỗi link cào thành công sẽ được lưu thành 1 file riêng. Bạn có thể đổi tên, tải về hoặc xóa ngay bên dưới!")
         
         urls_input = st.text_area("Nhập danh sách Link (mỗi link 1 dòng):", height=150)
         
@@ -386,15 +386,17 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
                 st.warning("Vui lòng nhập ít nhất 1 link.")
 
         # ==========================================
-        # TÍNH NĂNG MỚI: ĐỔI TÊN VÀ TẢI FILE VỀ MÁY TÍNH
+        # TÍNH NĂNG MỚI: ĐỔI TÊN, TẢI VÀ XÓA FILE VỀ MÁY TÍNH
         # ==========================================
         if st.session_state.novel_data.get("raw_docs"):
             st.write("---")
-            st.subheader("📥 Quản lý & Tải file đã cào về máy")
+            st.subheader("📥 Quản lý File đã cào (Tải về hoặc Xóa)")
             
             for i, doc in enumerate(st.session_state.novel_data["raw_docs"]):
                 with st.container(border=True):
-                    col_name, col_btn = st.columns([3, 1])
+                    # Chia làm 3 cột: Đổi tên, Tải xuống, Xóa
+                    col_name, col_down, col_del = st.columns([5, 2, 1])
+                    
                     with col_name:
                         # Ô nhập văn bản để đổi tên file
                         new_name = st.text_input(f"Tên file {i+1}:", value=doc["filename"], key=f"rename_{i}")
@@ -403,18 +405,27 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
                             st.session_state.novel_data["raw_docs"][i]["filename"] = new_name
                             save_user_data_to_supabase()
                     
-                    with col_btn:
+                    with col_down:
                         st.write("") # Căn chỉnh lề cho đẹp
                         st.write("")
                         # Nút bấm để tải về ổ cứng
                         st.download_button(
-                            label="💾 Tải về máy",
+                            label="💾 Tải về",
                             data=doc["content"],
                             file_name=new_name if new_name.endswith('.txt') else f"{new_name}.txt",
                             mime="text/plain",
                             key=f"dl_btn_{i}",
                             use_container_width=True
                         )
+                    
+                    with col_del:
+                        st.write("") # Căn chỉnh lề cho đẹp
+                        st.write("")
+                        # Nút bấm để xóa file
+                        if st.button("🗑️ Xóa", key=f"del_btn_{i}", use_container_width=True):
+                            st.session_state.novel_data["raw_docs"].pop(i)
+                            save_user_data_to_supabase()
+                            st.rerun() # Khởi động lại giao diện để file biến mất
 
     with tab2:
         st.subheader("📂 Tải lên hoặc Quản Lý File Raw (.txt)")
@@ -470,7 +481,7 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
                     st.success(f"✅ Đã tách file này thành {len(titles)} chương và đưa vào hàng chờ dịch!")
                     time.sleep(1); st.rerun()
 
-            if st.button("🗑️ Xóa File này"):
+            if st.button("🗑️ Xóa File này (Khỏi cơ sở dữ liệu)"):
                 st.session_state.novel_data["raw_docs"] = [d for d in st.session_state.novel_data["raw_docs"] if d["filename"] != selected_doc_name]
                 save_user_data_to_supabase()
                 st.rerun()
