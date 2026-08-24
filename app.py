@@ -43,14 +43,11 @@ if "trans_status" not in st.session_state: st.session_state.trans_status = {}
 if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
         "api_keys": {"gemini": ""},
-        "selected_model": "Gemini 2.5 Flash (Ổn định, Cực nhanh)",
+        "selected_model": "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
         "raw_docs": [],
         "raw_chapters": {},
         "trans_prompt": "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Dịch mượt mà, thuần Việt, giữ nguyên đoạn văn và không tự ý thêm bớt tình tiết."
     }
-
-if "is_translating" not in st.session_state:
-    st.session_state.is_translating = False
 
 # ==========================================
 # 2. HÀM TÁCH CHƯƠNG THÔNG MINH
@@ -107,7 +104,6 @@ def save_user_data_to_supabase():
 def reset_all_chapters():
     st.session_state.novel_data["raw_chapters"] = {}
     st.session_state.trans_status = {}
-    st.session_state.is_translating = False
     if supabase and st.session_state.user_email:
         try:
             supabase.table("workspaces").upsert({
@@ -116,6 +112,25 @@ def reset_all_chapters():
             }).execute()
         except Exception:
             pass
+
+# --- XUẤT FILE TỔNG HỢP ---
+def export_combined_text(chapters_dict: dict) -> str:
+    output = []
+    for k, v in chapters_dict.items():
+        translated = v.get("translated", "").strip()
+        if translated and "❌" not in translated:
+            output.append(f"=== {k} ===\n\n{translated}\n\n" + "="*40 + "\n\n")
+    return "".join(output)
+
+def export_zip_archive(chapters_dict: dict) -> bytes:
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for i, (k, v) in enumerate(chapters_dict.items()):
+            translated = v.get("translated", "").strip()
+            if translated and "❌" not in translated:
+                safe_filename = re.sub(r'[\\/*?:"<>|]', "", k)[:40]
+                zip_file.writestr(f"{i+1:03d}_{safe_filename}.txt", f"{k}\n\n{translated}")
+    return zip_buffer.getvalue()
 
 # --- CÁC HÀM CÀO DỮ LIỆU WEB ---
 def parse_zhihu_content(soup):
@@ -204,7 +219,7 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM CALL API TỐC ĐỘ CAO KÈM TIMEOUT & TỰ ĐỘNG THỬ LẠI ---
+# --- HÀM CALL API ---
 def _single_api_call(api_key, model_name, system_prompt, prompt_text):
     client = genai.Client(api_key=api_key)
     safety_settings = [
@@ -226,43 +241,45 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    # Thứ tự model dự phòng: nếu model chọn lỗi 404 thì tự động sang 2.5-flash hoặc 2.0-flash ngay
-    if "3.7 Flash" in str(model_choice):
-        models_to_try = ["gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-    elif "3.6 Flash" in str(model_choice):
-        models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-    elif "2.5 Pro" in str(model_choice):
-        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash"]
+    if "2.5 Pro" in str(model_choice):
+        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    elif "2.0 Flash" in str(model_choice):
+        models_to_try = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
     else:
         models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     last_error = ""
     for current_key in gemini_keys:
         for model_name in models_to_try:
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                    result_text = future.result(timeout=40)
-                    if result_text:
-                        return True, result_text
-                    else:
-                        last_error = f"Model {model_name} trả về rỗng."
-            except concurrent.futures.TimeoutError:
-                last_error = f"Timeout 40s tại model {model_name}."
-                continue
-            except Exception as e:
-                err_str = str(e)
-                last_error = f"{model_name}: {err_str}"
-                if "404" in err_str or "not found" in err_str.lower() or "unsupported" in err_str.lower():
+            for _ in range(2):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                        future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
+                        result_text = future.result(timeout=45)
+                        if result_text:
+                            return True, result_text
+                        else:
+                            last_error = f"Model {model_name} trả về rỗng."
+                except concurrent.futures.TimeoutError:
+                    last_error = f"Timeout 45s tại model {model_name}."
+                    time.sleep(1.5)
                     continue
-                elif "429" in err_str or "quota" in err_str.lower():
-                    break
+                except Exception as e:
+                    err_str = str(e)
+                    last_error = f"{model_name}: {err_str}"
+                    if "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
+                        time.sleep(2.0)
+                        break
+                    elif "404" in err_str or "not found" in err_str.lower():
+                        break
+                    elif "quota" in err_str.lower() or "exhausted" in err_str.lower():
+                        break
                     
     return False, f"Lỗi API: {last_error}"
 
 def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_data_dict, trans_status_dict, custom_prompt=None):
     base_prompt = custom_prompt if custom_prompt else novel_data_dict.get("trans_prompt", "Bạn là dịch giả.")
-    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch tiếng Việt mượt mà, giữ nguyên cấu trúc đoạn. Không giải thích thêm."
+    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch tiếng Việt mượt mà, thuần văn phong truyện, giữ nguyên cấu trúc đoạn. Không giải thích thêm."
     
     success, result = call_llm(system_prompt, f"RAW CẦN DỊCH:\n\n{raw_text}", api_keys, model_choice)
     if success:
@@ -319,11 +336,10 @@ if menu == "1. Cấu hình API":
     )
     
     model_options = [
-        "Gemini 2.5 Flash (Ổn định, Cực nhanh - Khuyên dùng)",
-        "Gemini 2.0 Flash (Bản mới, Rất mượt)",
-        "Gemini 2.5 Pro (Chất lượng cao, Văn phong mượt)",
-        "Gemini 3.7 Flash (Thử nghiệm)",
-        "Gemini 3.6 Flash (Thử nghiệm)"
+        "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
+        "Gemini 2.0 Flash (Tốc Độ Cao, Ít Nghẽn 503)",
+        "Gemini 2.5 Pro (Văn Phong Mượt Mà)",
+        "Gemini 1.5 Flash (Dự Phòng Nhẹ)"
     ]
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
@@ -521,22 +537,22 @@ elif menu == "3. Dịch & Quản Lý":
         col1, col2, col3 = st.columns([2, 2, 2])
         with col1: delay = st.number_input("Delay giữa các đợt dịch (giây):", value=1.0, min_value=0.5, step=0.5)
         with col2:
-            # Nút Xóa sạch toàn bộ
             if st.button("🗑️ Xóa toàn bộ hàng chờ (Reset)", type="primary", use_container_width=True):
                 reset_all_chapters()
                 st.success("✅ Đã xóa sạch toàn bộ hàng chờ!")
                 time.sleep(0.5)
                 st.rerun()
         with col3:
-            # Nút Dọn dẹp trạng thái bị kẹt
-            if st.button("🧹 Khôi phục trạng thái kẹt", use_container_width=True):
+            if st.button("🧹 Khôi phục chương bị lỗi", use_container_width=True):
                 for k in chap_keys:
-                    if "Đang dịch" in st.session_state.trans_status.get(k, ""):
+                    if "Lỗi" in st.session_state.trans_status.get(k, "") or "Đang dịch" in st.session_state.trans_status.get(k, ""):
                         st.session_state.trans_status[k] = "⏳ Đợi Dịch"
-                st.success("✅ Đã đưa các chương bị treo về trạng thái Đợi Dịch!")
+                        if "❌" in chapters[k].get("translated", ""):
+                            chapters[k]["translated"] = ""
+                save_user_data_to_supabase()
+                st.success("✅ Đã đưa các chương lỗi về trạng thái Đợi Dịch!")
                 st.rerun()
 
-        # DỊCH TRỰC TIẾP TRÊN GIAO DIỆN (CÓ THANH TIẾN ĐỘ THẬT)
         start_btn = st.button("🚀 BẮT ĐẦU DỊCH TỰ ĐỘNG (3 Chương / Lần)", type="primary", use_container_width=True)
 
         if start_btn:
@@ -548,7 +564,6 @@ elif menu == "3. Dịch & Quản Lý":
             if not keys_to_translate:
                 st.success("🎉 Tất cả các chương đều đã được dịch xong!")
             else:
-                st.info(f"Bắt đầu dịch {len(keys_to_translate)} chương chưa dịch...")
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
                 
@@ -563,7 +578,6 @@ elif menu == "3. Dịch & Quản Lý":
                     for k in batch:
                         st.session_state.trans_status[k] = "🔄 Đang dịch..."
                     
-                    # Gọi 3 luồng song song có hiển thị trực quan
                     with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
                         future_to_key = {
                             executor.submit(
@@ -583,7 +597,7 @@ elif menu == "3. Dịch & Quản Lý":
                     save_user_data_to_supabase()
                     time.sleep(delay)
                     
-                status_text.success("🎉 Đã hoàn thành toàn bộ đợt dịch!")
+                status_text.success("🎉 Đã hoàn tất đợt dịch tự động!")
                 time.sleep(1)
                 st.rerun()
 
@@ -603,7 +617,7 @@ elif menu == "3. Dịch & Quản Lý":
             
             col_act1, col_act2 = st.columns([4, 1])
             with col_act1:
-                if st.button(f"✨ Dịch riêng chương này (Thử ngay)", key=f"btn_{selected_key}", use_container_width=True):
+                if st.button(f"✨ Dịch riêng chương này (Thử lại ngay)", key=f"btn_{selected_key}", use_container_width=True):
                     st.session_state.trans_status[selected_key] = "🔄 Đang dịch..."
                     with st.spinner("Đang gọi API dịch chương này..."):
                         process_single_chapter(
@@ -632,5 +646,45 @@ elif menu == "3. Dịch & Quản Lý":
                 st.text_area("trans_text", chapters[selected_key].get("translated", ""), height=500, label_visibility="collapsed")
                         
         st.write("---")
-        if st.button("⬇️ Xuất EPUB", use_container_width=True):
-            st.info("Chức năng xuất EPUB chuẩn bị ra mắt!")
+        
+        # ==========================================
+        # KHU VỰC TẢI TOÀN BỘ CHƯƠNG VỀ MÁY TÍNH
+        # ==========================================
+        st.subheader("💾 Tải Toàn Bộ Bản Dịch Về Máy")
+        
+        done_chapters_count = sum(1 for v in chapters.values() if v.get("translated") and "❌" not in v.get("translated"))
+        st.write(f"Số chương đã dịch hoàn chỉnh sẵn sàng tải về: **{done_chapters_count}/{len(chap_keys)}**")
+        
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
+        
+        with col_dl1:
+            combined_txt = export_combined_text(chapters)
+            st.download_button(
+                label="📄 Tải 1 File .TXT (Gộp tất cả chương)",
+                data=combined_txt.encode('utf-8'),
+                file_name=f"Ban_Dich_Gop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                disabled=(done_chapters_count == 0)
+            )
+            
+        with col_dl2:
+            zip_data = export_zip_archive(chapters)
+            st.download_button(
+                label="📦 Tải File .ZIP (Mỗi chương 1 file .txt)",
+                data=zip_data,
+                file_name=f"Tung_Chuong_Zip_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+                disabled=(done_chapters_count == 0)
+            )
+            
+        with col_dl3:
+            json_str = json.dumps(st.session_state.novel_data, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="🗄️ Tải Bản Sao Lưu .JSON",
+                data=json_str.encode('utf-8'),
+                file_name=f"Backup_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
