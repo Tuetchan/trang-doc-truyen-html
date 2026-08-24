@@ -2,8 +2,6 @@ import streamlit as st
 import requests
 import re
 import time
-import threading
-import queue
 import io
 import zipfile
 import json
@@ -37,7 +35,6 @@ def init_supabase():
 
 supabase = init_supabase()
 
-# Regex xử lý sạch khoảng trắng tiếng Trung (\s, \u3000, space) và nhận diện đa định dạng
 DEFAULT_SPLIT_REGEX = r'(?m)^[\s\u3000]*(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部].*|[0-9]{1,5}\s*[、.．:：\s-]\s*\S.*|【[^】\n]+】|(?:Chapter|Chương)\s*[0-9]+.*)'
 
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
@@ -46,14 +43,14 @@ if "trans_status" not in st.session_state: st.session_state.trans_status = {}
 if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
         "api_keys": {"gemini": ""},
-        "selected_model": "Gemini 3.7 Flash (Mới nhất, Siêu tốc)",
+        "selected_model": "Gemini 2.5 Flash (Ổn định, Cực nhanh)",
         "raw_docs": [],
         "raw_chapters": {},
         "trans_prompt": "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Dịch mượt mà, thuần Việt, giữ nguyên đoạn văn và không tự ý thêm bớt tình tiết."
     }
 
-if "worker_running" not in st.session_state:
-    st.session_state.worker_running = False
+if "is_translating" not in st.session_state:
+    st.session_state.is_translating = False
 
 # ==========================================
 # 2. HÀM TÁCH CHƯƠNG THÔNG MINH
@@ -68,10 +65,8 @@ def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, 
     if not matches:
         return []
     
-    # Bỏ qua phần rác đầu dòng nếu chỉ toàn khoảng trắng hoặc quá ngắn
     if matches[0].start() > 0:
         intro_content = raw_text[:matches[0].start()].strip()
-        # Chỉ tạo phần mở đầu nếu nội dung chứa trên 50 ký tự chữ thực
         if len(re.sub(r'[\s\u3000\r\n]+', '', intro_content)) > 50:
             chapters.append(("Phần Mở Đầu / Tiền Truyện", intro_content))
             
@@ -110,9 +105,9 @@ def save_user_data_to_supabase():
             st.error(f"Lỗi lưu Supabase: {e}")
 
 def reset_all_chapters():
-    """Hàm dọn sạch toàn bộ hàng chờ dịch trên cả Session và Supabase Database"""
     st.session_state.novel_data["raw_chapters"] = {}
     st.session_state.trans_status = {}
+    st.session_state.is_translating = False
     if supabase and st.session_state.user_email:
         try:
             supabase.table("workspaces").upsert({
@@ -122,7 +117,7 @@ def reset_all_chapters():
         except Exception:
             pass
 
-# --- CÁC HÀM XỬ LÝ ZHIHU ---
+# --- CÁC HÀM CÀO DỮ LIỆU WEB ---
 def parse_zhihu_content(soup):
     texts = []
     script_tag = soup.find('script', id='js-initialData')
@@ -183,7 +178,6 @@ def scrape_zhihu_url(url, custom_cookie=""):
     except Exception as e: 
         return None, str(e)
 
-# --- HÀM CÀO WEB CHUNG ---
 def scrape_web_chapter(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -210,116 +204,75 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM GỌI LLM ---
+# --- HÀM CALL API TỐC ĐỘ CAO KÈM TIMEOUT & TỰ ĐỘNG THỬ LẠI ---
+def _single_api_call(api_key, model_name, system_prompt, prompt_text):
+    client = genai.Client(api_key=api_key)
+    safety_settings = [
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    ]
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt if system_prompt else None,
+        safety_settings=safety_settings,
+        temperature=0.3
+    )
+    res = client.models.generate_content(model=model_name, contents=prompt_text, config=config)
+    return res.text if (res and res.text) else None
+
 def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, str]:
     gemini_keys = [k.strip() for k in re.split(r'[\n,;\s]+', api_keys.get("gemini", "")) if k.strip()]
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    if "3.7 Flash" in str(model_choice): model_name = "gemini-3.7-flash"
-    elif "3.6 Flash" in str(model_choice): model_name = "gemini-3.6-flash"
-    elif "3.5 Flash" in str(model_choice): model_name = "gemini-3.5-flash"
-    elif "3.1 Flash-Lite" in str(model_choice): model_name = "gemini-3.1-flash-lite"
-    elif "2.5 Pro" in str(model_choice): model_name = "gemini-2.5-pro"
-    elif "2.5 Flash" in str(model_choice): model_name = "gemini-2.5-flash"
-    else: model_name = "gemini-3.7-flash" 
+    # Thứ tự model dự phòng: nếu model chọn lỗi 404 thì tự động sang 2.5-flash hoặc 2.0-flash ngay
+    if "3.7 Flash" in str(model_choice):
+        models_to_try = ["gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    elif "3.6 Flash" in str(model_choice):
+        models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    elif "2.5 Pro" in str(model_choice):
+        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash"]
+    else:
+        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
-    num_keys = len(gemini_keys)
     last_error = ""
-    
-    for i in range(num_keys):
-        current_key = gemini_keys[i]
-        try: 
-            client = genai.Client(api_key=current_key)
-            safety_settings = [
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            ]
-            
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt if system_prompt else None,
-                safety_settings=safety_settings,
-                temperature=0.3
-            )
-            
-            res = client.models.generate_content(model=model_name, contents=prompt_text, config=config)
-            if res and res.text:
-                return True, res.text
-            else:
-                last_error = "AI trả về kết quả rỗng."
-        except Exception as e:
-            last_error = str(e)
-            continue 
-            
+    for current_key in gemini_keys:
+        for model_name in models_to_try:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
+                    result_text = future.result(timeout=40)
+                    if result_text:
+                        return True, result_text
+                    else:
+                        last_error = f"Model {model_name} trả về rỗng."
+            except concurrent.futures.TimeoutError:
+                last_error = f"Timeout 40s tại model {model_name}."
+                continue
+            except Exception as e:
+                err_str = str(e)
+                last_error = f"{model_name}: {err_str}"
+                if "404" in err_str or "not found" in err_str.lower() or "unsupported" in err_str.lower():
+                    continue
+                elif "429" in err_str or "quota" in err_str.lower():
+                    break
+                    
     return False, f"Lỗi API: {last_error}"
 
 def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_data_dict, trans_status_dict, custom_prompt=None):
-    max_retries = 3
-    retry_count = 0
     base_prompt = custom_prompt if custom_prompt else novel_data_dict.get("trans_prompt", "Bạn là dịch giả.")
-    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch tiếng Việt mượt mà. Không giải thích thêm."
+    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch tiếng Việt mượt mà, giữ nguyên cấu trúc đoạn. Không giải thích thêm."
     
-    while retry_count < max_retries:
-        success, result = call_llm(system_prompt, f"RAW CẦN DỊCH:\n\n{raw_text}", api_keys, model_choice)
-        if success:
-            novel_data_dict["raw_chapters"][chap_key]["translated"] = result
-            trans_status_dict[chap_key] = "✅ Hoàn thành"
-            break
-        else:
-            retry_count += 1
-            if "429" in result or "quota" in result.lower() or "exhausted" in result.lower():
-                trans_status_dict[chap_key] = f"⚠️ Quá tải API (Chờ 30s thử lại lần {retry_count}/{max_retries})"
-                time.sleep(30)
-            else:
-                novel_data_dict["raw_chapters"][chap_key]["translated"] = f"❌ Lỗi: {result}"
-                trans_status_dict[chap_key] = "❌ Lỗi Hệ Thống"
-                break
-                
-    if retry_count >= max_retries:
-        trans_status_dict[chap_key] = "❌ Thất bại (Hết Quota)"
-
-def batch_worker(chap_keys_list, api_keys, model_choice, novel_data_dict, trans_status_dict, delay_time, user_email):
-    st.session_state.worker_running = True
-    batch_size = 3  
-    
-    keys_to_translate = [
-        k for k in chap_keys_list 
-        if not novel_data_dict["raw_chapters"][k].get("translated") or "❌" in novel_data_dict["raw_chapters"][k].get("translated", "")
-    ]
-
-    for i in range(0, len(keys_to_translate), batch_size):
-        batch = keys_to_translate[i : i + batch_size]
-        for k in batch:
-            trans_status_dict[k] = "🔄 Đang dịch..."
-            
-        with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
-            futures = [
-                executor.submit(
-                    process_single_chapter, 
-                    k, 
-                    novel_data_dict["raw_chapters"][k]["raw"], 
-                    api_keys, 
-                    model_choice, 
-                    novel_data_dict, 
-                    trans_status_dict
-                ) for k in batch
-            ]
-            concurrent.futures.wait(futures)
-            
-        if supabase and user_email:
-            try:
-                supabase.table("workspaces").upsert({
-                    "email": user_email, 
-                    "workspace_data": novel_data_dict
-                }).execute()
-            except Exception:
-                pass
-                
-        time.sleep(delay_time)
-        
-    st.session_state.worker_running = False
+    success, result = call_llm(system_prompt, f"RAW CẦN DỊCH:\n\n{raw_text}", api_keys, model_choice)
+    if success:
+        novel_data_dict["raw_chapters"][chap_key]["translated"] = result
+        trans_status_dict[chap_key] = "✅ Hoàn thành"
+        return True
+    else:
+        novel_data_dict["raw_chapters"][chap_key]["translated"] = f"❌ Lỗi: {result}"
+        trans_status_dict[chap_key] = f"❌ Lỗi: {result[:30]}"
+        return False
 
 # ==========================================
 # 4. GIAO DIỆN ĐĂNG NHẬP
@@ -366,12 +319,11 @@ if menu == "1. Cấu hình API":
     )
     
     model_options = [
-        "Gemini 3.7 Flash (Mới nhất, Siêu tốc)",
-        "Gemini 3.6 Flash (Cực nhanh, Tối ưu)",
-        "Gemini 3.5 Flash (Thông minh, Ổn định)",
-        "Gemini 3.1 Flash-Lite (Cực nhẹ, Raw dài)",
+        "Gemini 2.5 Flash (Ổn định, Cực nhanh - Khuyên dùng)",
+        "Gemini 2.0 Flash (Bản mới, Rất mượt)",
         "Gemini 2.5 Pro (Chất lượng cao, Văn phong mượt)",
-        "Gemini 2.5 Flash (Bản tiêu chuẩn)"
+        "Gemini 3.7 Flash (Thử nghiệm)",
+        "Gemini 3.6 Flash (Thử nghiệm)"
     ]
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
@@ -470,7 +422,6 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
             selected_doc = next(d for d in st.session_state.novel_data["raw_docs"] if d["filename"] == selected_doc_name)
             
             st.info(f"File **{selected_doc_name}** đang có khoảng {len(selected_doc['content'])} ký tự.")
-            
             regex_split = st.text_input("Regex Tách Chương:", value=DEFAULT_SPLIT_REGEX)
             
             if st.button("✂️ Bắt đầu Tách Chương từ File này", use_container_width=True):
@@ -528,7 +479,7 @@ elif menu == "3. Dịch & Quản Lý":
                             c_name = direct_file.name.replace(".txt", "")
                             st.session_state.novel_data["raw_chapters"][c_name] = {"raw": raw_content, "translated": ""}
                             st.session_state.trans_status[c_name] = "⏳ Đợi Dịch"
-                            st.info(f"Không tìm thấy tiêu đề chương khớp, đã thêm nguyên file '{c_name}'.")
+                            st.info(f"Đã thêm nguyên file '{c_name}'.")
                     else:
                         c_name = direct_file.name.replace(".txt", "")
                         st.session_state.novel_data["raw_chapters"][c_name] = {"raw": raw_content, "translated": ""}
@@ -562,49 +513,85 @@ elif menu == "3. Dịch & Quản Lý":
 
     chapters = st.session_state.novel_data.get("raw_chapters", {})
     if not chapters:
-        st.info("Chưa có chương nào trong hàng chờ dịch. Bạn có thể mở rộng khung **'📥 Tải File Raw Hoặc Dán Text Trực Tiếp Tại Đây'** ở trên để tải file và tách chương.")
+        st.info("Chưa có chương nào trong hàng chờ dịch.")
     else:
         chap_keys = list(chapters.keys())
         st.write(f"**Tổng số chương hiện có:** {len(chap_keys)}")
         
-        col1, col2 = st.columns(2)
-        with col1: delay = st.number_input("Delay giữa các lần dịch (giây):", value=2.0, min_value=0.5, step=0.5)
-        with col2: 
-            # Nút Xóa sạch toàn bộ hàng chờ trên cả Cloud và Local
-            if st.button("🗑️ Xóa toàn bộ hàng chờ (Reset)", type="primary"):
+        col1, col2, col3 = st.columns([2, 2, 2])
+        with col1: delay = st.number_input("Delay giữa các đợt dịch (giây):", value=1.0, min_value=0.5, step=0.5)
+        with col2:
+            # Nút Xóa sạch toàn bộ
+            if st.button("🗑️ Xóa toàn bộ hàng chờ (Reset)", type="primary", use_container_width=True):
                 reset_all_chapters()
-                st.success("✅ Đã xóa sạch toàn bộ hàng chờ cũ!")
+                st.success("✅ Đã xóa sạch toàn bộ hàng chờ!")
                 time.sleep(0.5)
                 st.rerun()
-                
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("🚀 Dịch Tự Động (3 Chương/Lần)", use_container_width=True):
-                if not st.session_state.worker_running:
-                    threading.Thread(
-                        target=batch_worker, 
-                        args=(
-                            chap_keys, 
-                            st.session_state.novel_data["api_keys"], 
-                            st.session_state.novel_data["selected_model"], 
-                            st.session_state.novel_data, 
-                            st.session_state.trans_status, 
-                            delay, 
-                            st.session_state.user_email
-                        ), 
-                        daemon=True
-                    ).start()
-                    st.toast("✅ Đã bắt đầu dịch!", icon="🚀")
-                else: st.toast("⚠️ Tiến trình dịch đang chạy rồi!", icon="⚠️")
-        with col_btn2:
-            if st.button("🔄 Làm mới giao diện", use_container_width=True):
+        with col3:
+            # Nút Dọn dẹp trạng thái bị kẹt
+            if st.button("🧹 Khôi phục trạng thái kẹt", use_container_width=True):
+                for k in chap_keys:
+                    if "Đang dịch" in st.session_state.trans_status.get(k, ""):
+                        st.session_state.trans_status[k] = "⏳ Đợi Dịch"
+                st.success("✅ Đã đưa các chương bị treo về trạng thái Đợi Dịch!")
                 st.rerun()
-        
+
+        # DỊCH TRỰC TIẾP TRÊN GIAO DIỆN (CÓ THANH TIẾN ĐỘ THẬT)
+        start_btn = st.button("🚀 BẮT ĐẦU DỊCH TỰ ĐỘNG (3 Chương / Lần)", type="primary", use_container_width=True)
+
+        if start_btn:
+            keys_to_translate = [
+                k for k in chap_keys 
+                if not chapters[k].get("translated") or "❌" in chapters[k].get("translated", "")
+            ]
+            
+            if not keys_to_translate:
+                st.success("🎉 Tất cả các chương đều đã được dịch xong!")
+            else:
+                st.info(f"Bắt đầu dịch {len(keys_to_translate)} chương chưa dịch...")
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
+                
+                batch_size = 3
+                total_batches = (len(keys_to_translate) + batch_size - 1) // batch_size
+                completed_count = 0
+                
+                for b_idx in range(0, len(keys_to_translate), batch_size):
+                    batch = keys_to_translate[b_idx : b_idx + batch_size]
+                    
+                    status_text.markdown(f"**⚡ Đang dịch đợt {b_idx//batch_size + 1}/{total_batches}:** `{', '.join([k[:20] for k in batch])}`")
+                    for k in batch:
+                        st.session_state.trans_status[k] = "🔄 Đang dịch..."
+                    
+                    # Gọi 3 luồng song song có hiển thị trực quan
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                        future_to_key = {
+                            executor.submit(
+                                process_single_chapter,
+                                k,
+                                chapters[k]["raw"],
+                                st.session_state.novel_data["api_keys"],
+                                st.session_state.novel_data["selected_model"],
+                                st.session_state.novel_data,
+                                st.session_state.trans_status
+                            ): k for k in batch
+                        }
+                        for future in concurrent.futures.as_completed(future_to_key):
+                            completed_count += 1
+                            progress_bar.progress(completed_count / len(keys_to_translate))
+                            
+                    save_user_data_to_supabase()
+                    time.sleep(delay)
+                    
+                status_text.success("🎉 Đã hoàn thành toàn bộ đợt dịch!")
+                time.sleep(1)
+                st.rerun()
+
         st.write("---")
         
         for k in chap_keys:
             if k not in st.session_state.trans_status: 
-                status = "✅ Hoàn thành" if chapters[k].get("translated") else "⏳ Đợi Dịch"
+                status = "✅ Hoàn thành" if (chapters[k].get("translated") and "❌" not in chapters[k].get("translated")) else "⏳ Đợi Dịch"
                 st.session_state.trans_status[k] = status
                 
         st.subheader("📖 Xem & Chỉnh sửa bản dịch")
@@ -616,17 +603,18 @@ elif menu == "3. Dịch & Quản Lý":
             
             col_act1, col_act2 = st.columns([4, 1])
             with col_act1:
-                if st.button(f"✨ Dịch riêng chương này", key=f"btn_{selected_key}", use_container_width=True):
+                if st.button(f"✨ Dịch riêng chương này (Thử ngay)", key=f"btn_{selected_key}", use_container_width=True):
                     st.session_state.trans_status[selected_key] = "🔄 Đang dịch..."
-                    process_single_chapter(
-                        selected_key, 
-                        chapters[selected_key]["raw"], 
-                        st.session_state.novel_data["api_keys"], 
-                        st.session_state.novel_data["selected_model"], 
-                        st.session_state.novel_data, 
-                        st.session_state.trans_status
-                    )
-                    save_user_data_to_supabase()
+                    with st.spinner("Đang gọi API dịch chương này..."):
+                        process_single_chapter(
+                            selected_key, 
+                            chapters[selected_key]["raw"], 
+                            st.session_state.novel_data["api_keys"], 
+                            st.session_state.novel_data["selected_model"], 
+                            st.session_state.novel_data, 
+                            st.session_state.trans_status
+                        )
+                        save_user_data_to_supabase()
                     st.rerun()
             with col_act2:
                 if st.button("🗑️ Xóa chương này", key=f"del_single_{selected_key}", use_container_width=True):
