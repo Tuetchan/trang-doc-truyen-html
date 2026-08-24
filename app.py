@@ -37,7 +37,9 @@ def init_supabase():
 
 supabase = init_supabase()
 
-# Khởi tạo Session State
+# Regex đa năng chuẩn xác (bắt 第X章, 27、, 28., 【卷...】, Chapter X, Chương X)
+DEFAULT_SPLIT_REGEX = r'(?m)^\s*(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部].*|[0-9]{1,5}\s*[、.．:：\s-]\s*\S.*|【[^】\n]+】|(?:Chapter|Chương)\s*[0-9]+.*)'
+
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
 if "user_email" not in st.session_state: st.session_state.user_email = ""
 if "trans_status" not in st.session_state: st.session_state.trans_status = {}
@@ -54,7 +56,40 @@ if "worker_running" not in st.session_state:
     st.session_state.worker_running = False
 
 # ==========================================
-# 2. HÀM HỖ TRỢ & CALL API
+# 2. HÀM TÁCH CHƯƠNG THÔNG MINH
+# ==========================================
+def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, str]]:
+    """Tách truyện chuẩn xác theo vị trí tìm kiếm của Regex, giữ trọn vẹn tiêu đề và nội dung"""
+    reg = custom_regex.strip() if custom_regex and custom_regex.strip() else DEFAULT_SPLIT_REGEX
+    pattern = re.compile(reg, re.MULTILINE)
+    
+    matches = list(pattern.finditer(raw_text))
+    chapters = []
+    
+    if not matches:
+        return []
+    
+    # Nếu có phần mở đầu trước chương 1
+    if matches[0].start() > 0:
+        intro_content = raw_text[:matches[0].start()].strip()
+        if len(intro_content) > 30:
+            chapters.append(("Phần Mở Đầu / Tiền Truyện", intro_content))
+            
+    for i, match in enumerate(matches):
+        title = match.group(0).strip()
+        start_idx = match.end()
+        end_idx = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
+        content = raw_text[start_idx:end_idx].strip()
+        
+        # Làm gọn tiêu đề (giới hạn ký tự nếu quá dài)
+        safe_title = re.sub(r'[\r\n]+', ' ', title)[:50].strip()
+        if content:
+            chapters.append((safe_title, content))
+            
+    return chapters
+
+# ==========================================
+# 3. HÀM HỖ TRỢ & CALL API
 # ==========================================
 def load_user_data_from_supabase(email):
     if supabase:
@@ -164,13 +199,13 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM GỌI LLM & WORKER PHÂN LUỒNG ---
+# --- HÀM GỌI LLM CHO 3.7 & 3.6 FLASH ---
 def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, str]:
     gemini_keys = [k.strip() for k in re.split(r'[\n,;\s]+', api_keys.get("gemini", "")) if k.strip()]
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    # Ánh xạ model tương ứng với phiên bản mới nhất
+    # Định tuyến model chính xác
     if "3.7 Flash" in str(model_choice): model_name = "gemini-3.7-flash"
     elif "3.6 Flash" in str(model_choice): model_name = "gemini-3.6-flash"
     elif "3.5 Flash" in str(model_choice): model_name = "gemini-3.5-flash"
@@ -204,7 +239,7 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
             if res and res.text:
                 return True, res.text
             else:
-                last_error = "AI trả về kết quả rỗng (Có thể bị Google block ngầm)."
+                last_error = "AI trả về kết quả rỗng (Có thể bị chặn filter)."
                 
         except Exception as e:
             last_error = str(e)
@@ -215,13 +250,11 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
 def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_data_dict, trans_status_dict, custom_prompt=None):
     max_retries = 3
     retry_count = 0
-    
     base_prompt = custom_prompt if custom_prompt else novel_data_dict.get("trans_prompt", "Bạn là dịch giả.")
-    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch. Không giải thích."
+    system_prompt = base_prompt + "\n\n[LỆNH BẮT BUỘC]: Trả về trực tiếp bản dịch tiếng Việt mượt mà. Không giải thích thêm."
     
     while retry_count < max_retries:
         success, result = call_llm(system_prompt, f"RAW CẦN DỊCH:\n\n{raw_text}", api_keys, model_choice)
-        
         if success:
             novel_data_dict["raw_chapters"][chap_key]["translated"] = result
             trans_status_dict[chap_key] = "✅ Hoàn thành"
@@ -250,7 +283,6 @@ def batch_worker(chap_keys_list, api_keys, model_choice, novel_data_dict, trans_
 
     for i in range(0, len(keys_to_translate), batch_size):
         batch = keys_to_translate[i : i + batch_size]
-        
         for k in batch:
             trans_status_dict[k] = "🔄 Đang dịch..."
             
@@ -282,7 +314,7 @@ def batch_worker(chap_keys_list, api_keys, model_choice, novel_data_dict, trans_
     st.session_state.worker_running = False
 
 # ==========================================
-# 3. GIAO DIỆN ĐĂNG NHẬP
+# 4. GIAO DIỆN ĐĂNG NHẬP
 # ==========================================
 if not st.session_state.authenticated:
     st.title("⚡ Máy Dịch Truyện - Tối Giản")
@@ -309,7 +341,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==========================================
-# 4. GIAO DIỆN CHÍNH & CHỨC NĂNG
+# 5. GIAO DIỆN CHÍNH & CHỨC NĂNG
 # ==========================================
 st.sidebar.title("⚡ Menu")
 menu = st.sidebar.radio("Chọn chức năng:", ["1. Cấu hình API", "2. Nguồn Truyện (Cào/Tải Raw)", "3. Dịch & Quản Lý"])
@@ -325,7 +357,6 @@ if menu == "1. Cấu hình API":
         height=150
     )
     
-    # Cập nhật danh sách các model mới nhất 3.7 và 3.6 Flash
     model_options = [
         "Gemini 3.7 Flash (Mới nhất, Siêu tốc)",
         "Gemini 3.6 Flash (Cực nhanh, Tối ưu)",
@@ -338,17 +369,8 @@ if menu == "1. Cấu hình API":
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
     current_idx = model_options.index(current_model) if current_model in model_options else 0
     
-    st.session_state.novel_data["selected_model"] = st.selectbox(
-        "Lựa chọn Model Dịch:", 
-        model_options,
-        index=current_idx
-    )
-    
-    st.session_state.novel_data["trans_prompt"] = st.text_area(
-        "Prompt Dịch (Ví dụ: Giọng cổ đại, ngôn tình, hài hước...):", 
-        value=st.session_state.novel_data.get("trans_prompt", ""), 
-        height=100
-    )
+    st.session_state.novel_data["selected_model"] = st.selectbox("Lựa chọn Model Dịch:", model_options, index=current_idx)
+    st.session_state.novel_data["trans_prompt"] = st.text_area("Prompt Dịch (Ví dụ: Giọng cổ đại, ngôn tình...):", value=st.session_state.novel_data.get("trans_prompt", ""), height=100)
     
     if st.button("💾 Lưu Cấu Hình", use_container_width=True): 
         save_user_data_to_supabase()
@@ -360,12 +382,9 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
     
     with tab1:
         st.subheader("Cào Raw từ nhiều Website (Bao gồm Zhihu)")
-        st.info("💡 Mỗi link cào thành công sẽ được lưu thành 1 file riêng. Bạn có thể đổi tên, tải về hoặc xóa ngay bên dưới!")
-        
         urls_input = st.text_area("Nhập danh sách Link (mỗi link 1 dòng):", height=150)
-        
         with st.expander("⚙️ (Tùy chọn) Nhập Cookie cho Zhihu trả phí"):
-            custom_cookie = st.text_area("Dán Cookie Zhihu vào đây:", help="Dùng Cookie-Editor chọn dạng JSON và dán vào đây.")
+            custom_cookie = st.text_area("Dán Cookie Zhihu vào đây:")
             
         if st.button("🕷️ Bắt đầu cào & Lưu thành các File riêng lẻ", use_container_width=True):
             if urls_input.strip():
@@ -373,26 +392,22 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
                 if "raw_docs" not in st.session_state.novel_data: st.session_state.novel_data["raw_docs"] = []
                 
                 success_count = 0
-                with st.spinner(f"Đang cào {len(urls)} link... (Vui lòng đợi)"):
+                with st.spinner(f"Đang cào {len(urls)} link..."):
                     for url in urls:
                         if "zhihu.com" in url:
                             raw_text, err_msg = scrape_zhihu_url(url, custom_cookie)
                             if err_msg:
-                                st.error(f"❌ Lỗi cào web Zhihu tại link {url}: {err_msg}")
+                                st.error(f"❌ Lỗi link Zhihu {url}: {err_msg}")
                             elif raw_text:
                                 safe_title = re.sub(r'[\\/*?:"<>|]', "", url.split('/')[-1]) or "zhihu_post"
                                 file_name = f"Zhihu_{safe_title}_{datetime.now().strftime('%H%M%S')}.txt"
-                                
                                 st.session_state.novel_data["raw_docs"].append({"filename": file_name, "content": raw_text})
                                 success_count += 1
-                            else:
-                                st.warning(f"⚠️ Link Zhihu {url} không tìm thấy nội dung hoặc quá ngắn.")
                         else:
                             title, scraped_text = scrape_web_chapter(url)
                             if "❌" not in scraped_text:
                                 safe_title = re.sub(r'[\\/*?:"<>|]', "", title)[:30]
                                 file_name = f"Web_{safe_title}_{datetime.now().strftime('%H%M%S')}.txt"
-                                
                                 st.session_state.novel_data["raw_docs"].append({"filename": file_name, "content": scraped_text})
                                 success_count += 1
                             else:
@@ -404,36 +419,22 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
             else:
                 st.warning("Vui lòng nhập ít nhất 1 link.")
 
-        # Quản lý File đã cào
         if st.session_state.novel_data.get("raw_docs"):
             st.write("---")
-            st.subheader("📥 Quản lý File đã cào (Tải về hoặc Xóa)")
-            
+            st.subheader("📥 Quản lý File đã cào")
             for i, doc in enumerate(st.session_state.novel_data["raw_docs"]):
                 with st.container(border=True):
                     col_name, col_down, col_del = st.columns([5, 2, 1])
-                    
                     with col_name:
                         new_name = st.text_input(f"Tên file {i+1}:", value=doc["filename"], key=f"rename_{i}")
                         if new_name != doc["filename"]:
                             st.session_state.novel_data["raw_docs"][i]["filename"] = new_name
                             save_user_data_to_supabase()
-                    
                     with col_down:
-                        st.write("")
-                        st.write("")
-                        st.download_button(
-                            label="💾 Tải về",
-                            data=doc["content"],
-                            file_name=new_name if new_name.endswith('.txt') else f"{new_name}.txt",
-                            mime="text/plain",
-                            key=f"dl_btn_{i}",
-                            use_container_width=True
-                        )
-                    
+                        st.write(""); st.write("")
+                        st.download_button("💾 Tải về", data=doc["content"], file_name=new_name if new_name.endswith('.txt') else f"{new_name}.txt", mime="text/plain", key=f"dl_btn_{i}", use_container_width=True)
                     with col_del:
-                        st.write("")
-                        st.write("")
+                        st.write(""); st.write("")
                         if st.button("🗑️ Xóa", key=f"del_btn_{i}", use_container_width=True):
                             st.session_state.novel_data["raw_docs"].pop(i)
                             save_user_data_to_supabase()
@@ -458,105 +459,89 @@ elif menu == "2. Nguồn Truyện (Cào/Tải Raw)":
             st.write("### 📚 Danh sách File Raw hiện có:")
             doc_names = [d["filename"] for d in st.session_state.novel_data["raw_docs"]]
             selected_doc_name = st.selectbox("Chọn File độc lập để Tách chương:", doc_names)
-            
             selected_doc = next(d for d in st.session_state.novel_data["raw_docs"] if d["filename"] == selected_doc_name)
             
             st.info(f"File **{selected_doc_name}** đang có khoảng {len(selected_doc['content'])} ký tự.")
             
-            col1, col2 = st.columns(2)
-            with col1: regex_split = st.text_input("Regex Tách Chương:", value=r"(第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部])")
-            with col2: str_split = st.text_input("Hoặc Tách theo Từ Khóa (VD: Chương, Chapter):")
+            regex_split = st.text_input("Regex Tách Chương (Hỗ trợ 第X章, 27、, 28., 【...】):", value=DEFAULT_SPLIT_REGEX)
             
-            if st.button("✂️ Bắt đầu Tách Chương từ File này"):
+            if st.button("✂️ Bắt đầu Tách Chương từ File này", use_container_width=True):
                 raw_text = selected_doc["content"]
-                if str_split: 
-                    parts = raw_text.split(str_split)
-                    titles = [f"{str_split} {i}" for i in range(1, len(parts))]
-                    contents = parts[1:]
-                else: 
-                    parts = re.split(regex_split, raw_text)
-                    if len(parts) > 1:
-                        titles = parts[1::2]
-                        contents = parts[2::2]
-                    else: titles, contents = [], []
+                extracted_chapters = smart_split_novel(raw_text, regex_split)
                 
-                if not titles: st.warning("Không tìm thấy chương nào theo quy tắc trên!")
+                if not extracted_chapters: 
+                    st.warning("Không tìm thấy chương nào theo quy tắc Regex trên!")
                 else:
-                    if "raw_chapters" not in st.session_state.novel_data: st.session_state.novel_data["raw_chapters"] = {}
+                    if "raw_chapters" not in st.session_state.novel_data: 
+                        st.session_state.novel_data["raw_chapters"] = {}
                     
-                    for t, c in zip(titles, contents):
+                    for t, c in extracted_chapters:
                         chap_name = f"[{selected_doc_name[:10]}] {t.strip()}"
-                        st.session_state.novel_data["raw_chapters"][chap_name] = {"raw": f"{chap_name}\n{c.strip()}", "translated": ""}
+                        st.session_state.novel_data["raw_chapters"][chap_name] = {"raw": f"{t.strip()}\n\n{c.strip()}", "translated": ""}
                         st.session_state.trans_status[chap_name] = "⏳ Đợi Dịch"
                         
                     save_user_data_to_supabase()
-                    st.success(f"✅ Đã tách file này thành {len(titles)} chương và đưa vào hàng chờ dịch!")
-                    time.sleep(1); st.rerun()
+                    st.success(f"✅ Đã tách chính xác {len(extracted_chapters)} chương!")
+                    time.sleep(1)
+                    st.rerun()
 
-            if st.button("🗑️ Xóa File này (Khỏi cơ sở dữ liệu)"):
+            if st.button("🗑️ Xóa File này (Khỏi bộ nhớ)"):
                 st.session_state.novel_data["raw_docs"] = [d for d in st.session_state.novel_data["raw_docs"] if d["filename"] != selected_doc_name]
                 save_user_data_to_supabase()
                 st.rerun()
 
-# --- MENU 3: DỊCH & QUẢN LÝ ---
+# --- MENU 3: DỊCH & QUẢN LÝ (CÓ TẢI RAW TRỰC TIẾP) ---
 elif menu == "3. Dịch & Quản Lý":
     st.header("⏳ Hàng chờ & Dịch Thuật")
     
-    # =========================================================
-    # TÍNH NĂNG MỚI: TẢI HOẶC DÁN RAW TRỰC TIẾP TẠI MỤC DỊCH
-    # =========================================================
-    with st.expander("📥 Thêm Raw Nhanh Để Dịch Trực Tiếp", expanded=False):
+    # Khu vực tải raw trực tiếp tại Tab 3
+    with st.expander("📥 Tải File Raw Hoặc Dán Text Trực Tiếp Tại Đây", expanded=False):
         tab_up, tab_paste = st.tabs(["📁 Tải File .txt lên", "✍️ Dán Raw thủ công"])
         
         with tab_up:
-            direct_file = st.file_uploader("Tải file .txt raw để đưa vào hàng chờ:", type=["txt"], key="direct_txt_uploader")
-            col_d1, col_d2 = st.columns(2)
-            with col_d1:
-                direct_regex = st.text_input("Regex tách chương:", value=r"(第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部])", key="direct_reg")
-            with col_d2:
-                auto_split_opt = st.checkbox("Tự động tách chương theo Regex", value=True)
+            direct_file = st.file_uploader("Chọn file .txt cần đưa vào hàng chờ:", type=["txt"], key="direct_txt_uploader")
+            direct_regex = st.text_input("Regex nhận diện tiêu đề chương:", value=DEFAULT_SPLIT_REGEX, key="direct_reg")
+            auto_split_opt = st.checkbox("Tự động nhận diện và tách chương", value=True)
             
-            if st.button("🚀 Nạp File này vào Hàng Chờ Dịch", key="btn_load_file_direct", use_container_width=True):
+            if st.button("🚀 Nạp và Tách Chương Vào Hàng Chờ", key="btn_load_file_direct", use_container_width=True):
                 if direct_file is not None:
                     raw_content = direct_file.read().decode('utf-8', errors='ignore')
                     if "raw_chapters" not in st.session_state.novel_data:
                         st.session_state.novel_data["raw_chapters"] = {}
                     
                     if auto_split_opt:
-                        parts = re.split(direct_regex, raw_content)
-                        if len(parts) > 1:
-                            titles = parts[1::2]
-                            contents = parts[2::2]
-                            for t, c in zip(titles, contents):
+                        extracted = smart_split_novel(raw_content, direct_regex)
+                        if extracted:
+                            for t, c in extracted:
                                 c_name = f"[{direct_file.name[:8]}] {t.strip()}"
-                                st.session_state.novel_data["raw_chapters"][c_name] = {"raw": f"{c_name}\n{c.strip()}", "translated": ""}
+                                st.session_state.novel_data["raw_chapters"][c_name] = {"raw": f"{t.strip()}\n\n{c.strip()}", "translated": ""}
                                 st.session_state.trans_status[c_name] = "⏳ Đợi Dịch"
-                            st.success(f"✅ Đã nạp và tách thành công {len(titles)} chương vào hàng chờ!")
+                            st.success(f"✅ Tách thành công {len(extracted)} chương chuẩn xác!")
                         else:
                             c_name = direct_file.name.replace(".txt", "")
                             st.session_state.novel_data["raw_chapters"][c_name] = {"raw": raw_content, "translated": ""}
                             st.session_state.trans_status[c_name] = "⏳ Đợi Dịch"
-                            st.success(f"✅ Đã thêm nguyên file '{c_name}' vào hàng chờ!")
+                            st.info(f"Không tìm thấy tiêu đề chương khớp, đã thêm nguyên file '{c_name}'.")
                     else:
                         c_name = direct_file.name.replace(".txt", "")
                         st.session_state.novel_data["raw_chapters"][c_name] = {"raw": raw_content, "translated": ""}
                         st.session_state.trans_status[c_name] = "⏳ Đợi Dịch"
-                        st.success(f"✅ Đã thêm file '{c_name}' vào hàng chờ!")
+                        st.success(f"✅ Đã thêm nguyên file '{c_name}' vào hàng chờ!")
                         
                     save_user_data_to_supabase()
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.warning("Vui lòng chọn file .txt trước.")
+                    st.warning("Vui lòng tải lên file .txt trước.")
 
         with tab_paste:
-            quick_title = st.text_input("Tên chương / Tiêu đề:", value=f"Chương_{datetime.now().strftime('%H%M%S')}")
+            quick_title = st.text_input("Tên / Tiêu đề:", value=f"Chương_{datetime.now().strftime('%H%M%S')}")
             quick_raw = st.text_area("Dán nội dung raw tiếng Trung vào đây:", height=150)
-            if st.button("➕ Thêm vào Hàng Chờ Dịch", key="btn_paste_direct", use_container_width=True):
+            if st.button("➕ Thêm vào hàng chờ", key="btn_paste_direct", use_container_width=True):
                 if quick_raw.strip():
                     if "raw_chapters" not in st.session_state.novel_data:
                         st.session_state.novel_data["raw_chapters"] = {}
-                    c_title = quick_title.strip() or f"Chương_{datetime.now().strftime('%H%M%S')}"
+                    c_title = quick_title.strip()
                     st.session_state.novel_data["raw_chapters"][c_title] = {"raw": quick_raw.strip(), "translated": ""}
                     st.session_state.trans_status[c_title] = "⏳ Đợi Dịch"
                     save_user_data_to_supabase()
@@ -570,12 +555,11 @@ elif menu == "3. Dịch & Quản Lý":
 
     chapters = st.session_state.novel_data.get("raw_chapters", {})
     if not chapters:
-        st.info("Chưa có chương nào trong hàng chờ. Bạn có thể mở rộng mục **'📥 Thêm Raw Nhanh Để Dịch Trực Tiếp'** ở trên để tải file lên.")
+        st.info("Chưa có chương nào trong hàng chờ dịch. Bạn có thể mở rộng khung **'📥 Tải File Raw Hoặc Dán Text Trực Tiếp Tại Đây'** ở trên để bắt đầu.")
     else:
         chap_keys = list(chapters.keys())
         st.write(f"**Tổng số chương hiện có:** {len(chap_keys)}")
         
-        # 1. Các nút điều khiển tổng
         col1, col2 = st.columns(2)
         with col1: delay = st.number_input("Delay giữa các lần dịch (giây):", value=2.0, min_value=0.5, step=0.5)
         with col2: 
@@ -602,7 +586,7 @@ elif menu == "3. Dịch & Quản Lý":
                         ), 
                         daemon=True
                     ).start()
-                    st.toast("✅ Đã bắt đầu dịch 3 chương cùng lúc!", icon="🚀")
+                    st.toast("✅ Đã bắt đầu dịch!", icon="🚀")
                 else: st.toast("⚠️ Tiến trình dịch đang chạy rồi!", icon="⚠️")
         with col_btn2:
             if st.button("🔄 Làm mới giao diện", use_container_width=True):
@@ -610,24 +594,19 @@ elif menu == "3. Dịch & Quản Lý":
         
         st.write("---")
         
-        # Cập nhật status cho toàn bộ danh sách chương trước khi render menu thả xuống
         for k in chap_keys:
             if k not in st.session_state.trans_status: 
                 status = "✅ Hoàn thành" if chapters[k].get("translated") else "⏳ Đợi Dịch"
                 st.session_state.trans_status[k] = status
                 
-        # ==========================================
-        # GIAO DIỆN XEM & CHỈNH SỬA
-        # ==========================================
         st.subheader("📖 Xem & Chỉnh sửa bản dịch")
-        
         options = [f"{k}   ---   ({st.session_state.trans_status[k]})" for k in chap_keys]
         selected_option = st.selectbox("Chọn chương muốn xem:", options)
         
         if selected_option:
             selected_key = selected_option.split("   ---   ")[0]
             
-            if st.button(f"✨ Bấm để Dịch chương này", key=f"btn_{selected_key}"):
+            if st.button(f"✨ Dịch riêng chương này", key=f"btn_{selected_key}"):
                 st.session_state.trans_status[selected_key] = "🔄 Đang dịch..."
                 process_single_chapter(
                     selected_key, 
@@ -650,4 +629,4 @@ elif menu == "3. Dịch & Quản Lý":
                         
         st.write("---")
         if st.button("⬇️ Xuất EPUB", use_container_width=True):
-            st.info("Chức năng xuất EPUB chuẩn bị ra mắt, vui lòng copy text tạm nhé!")
+            st.info("Chức năng xuất EPUB chuẩn bị ra mắt!")
