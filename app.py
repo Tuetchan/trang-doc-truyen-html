@@ -35,7 +35,8 @@ def init_supabase():
 
 supabase = init_supabase()
 
-DEFAULT_SPLIT_REGEX = r'(?m)^[\s\u3000]*(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部].*|[0-9]{1,5}\s*[、.．:：\s-]\s*\S.*|【[^】\n]+】|(?:Chapter|Chương)\s*[0-9]+.*)'
+# Regex xử lý sạch mọi trường hợp dính dòng: bắt 34、, 35、, 第35章, ☆、第35章, 【卷...】
+DEFAULT_SPLIT_REGEX = r'(?:[\r\n\s\u3000]+|^)(?:☆\s*、\s*)?(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部]|(?:Chapter|Chương)\s*[0-9]+|[0-9]{1,5}\s*[、.．:：\s-])\s*([^\r\n]{0,35})'
 
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
 if "user_email" not in st.session_state: st.session_state.user_email = ""
@@ -50,11 +51,12 @@ if "novel_data" not in st.session_state:
     }
 
 # ==========================================
-# 2. HÀM TÁCH CHƯƠNG THÔNG MINH
+# 2. HÀM TÁCH CHƯƠNG CHÍNH XÁC (CHỐNG MẤT CHƯƠNG DÍNH LIỀN)
 # ==========================================
 def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, str]]:
+    """Tách chuẩn xác kể cả khi chương 35 bị dính liền đuôi chương 34"""
     reg = custom_regex.strip() if custom_regex and custom_regex.strip() else DEFAULT_SPLIT_REGEX
-    pattern = re.compile(reg, re.MULTILINE)
+    pattern = re.compile(reg)
     
     matches = list(pattern.finditer(raw_text))
     chapters = []
@@ -62,20 +64,24 @@ def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, 
     if not matches:
         return []
     
-    if matches[0].start() > 0:
-        intro_content = raw_text[:matches[0].start()].strip()
+    # Xử lý đoạn mở đầu nếu có
+    first_match = matches[0]
+    if first_match.start() > 0:
+        intro_content = raw_text[:first_match.start()].strip()
+        # Bỏ qua nếu phần đầu chỉ là khoảng trắng vô nghĩa
         if len(re.sub(r'[\s\u3000\r\n]+', '', intro_content)) > 50:
             chapters.append(("Phần Mở Đầu / Tiền Truyện", intro_content))
             
     for i, match in enumerate(matches):
-        title = match.group(0).strip()
+        raw_title = match.group(0).strip()
         start_idx = match.end()
         end_idx = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
         content = raw_text[start_idx:end_idx].strip()
         
-        safe_title = re.sub(r'[\r\n\u3000\t]+', ' ', title)[:50].strip()
+        # Làm sạch tiêu đề hiển thị
+        clean_title = re.sub(r'[\r\n\u3000\t]+', ' ', raw_title)[:50].strip()
         if content:
-            chapters.append((safe_title, content))
+            chapters.append((clean_title, content))
             
     return chapters
 
@@ -113,7 +119,6 @@ def reset_all_chapters():
         except Exception:
             pass
 
-# --- XUẤT FILE TỔNG HỢP ---
 def export_combined_text(chapters_dict: dict) -> str:
     output = []
     for k, v in chapters_dict.items():
@@ -132,7 +137,7 @@ def export_zip_archive(chapters_dict: dict) -> bytes:
                 zip_file.writestr(f"{i+1:03d}_{safe_filename}.txt", f"{k}\n\n{translated}")
     return zip_buffer.getvalue()
 
-# --- CÁC HÀM CÀO DỮ LIỆU WEB ---
+# --- CÁC HÀM CÀO WEB ---
 def parse_zhihu_content(soup):
     texts = []
     script_tag = soup.find('script', id='js-initialData')
@@ -646,14 +651,10 @@ elif menu == "3. Dịch & Quản Lý":
                 st.text_area("trans_text", chapters[selected_key].get("translated", ""), height=500, label_visibility="collapsed")
                         
         st.write("---")
-        
-        # ==========================================
-        # KHU VỰC TẢI TOÀN BỘ CHƯƠNG VỀ MÁY TÍNH
-        # ==========================================
         st.subheader("💾 Tải Toàn Bộ Bản Dịch Về Máy")
         
         done_chapters_count = sum(1 for v in chapters.values() if v.get("translated") and "❌" not in v.get("translated"))
-        st.write(f"Số chương đã dịch hoàn chỉnh sẵn sàng tải về: **{done_chapters_count}/{len(chap_keys)}**")
+        st.write(f"Số chương đã dịch hoàn chỉnh: **{done_chapters_count}/{len(chap_keys)}**")
         
         col_dl1, col_dl2, col_dl3 = st.columns(3)
         
