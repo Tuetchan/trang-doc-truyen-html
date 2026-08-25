@@ -35,8 +35,7 @@ def init_supabase():
 
 supabase = init_supabase()
 
-# REGEX MỚI: Bắt chính xác tiêu đề kể cả khi nó bị dán dính liền vào cuối đoạn văn trước
-# (Ví dụ: "说道。 45、试试？   炎亚龙" -> Bắt chính xác "45、试试？")
+# Regex xử lý sạch khoảng trắng tiếng Trung
 DEFAULT_SPLIT_REGEX = r'(?:^|(?<=[。！？】”’"\'\s]))((?:【[^】\n]+】|(?:☆\s*、\s*)?(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部]|(?:Chapter|Chương)\s*[0-9]+|[0-9]{1,5}\s*[、.．:：\s]))[^\u3000\r\n]{0,40}?)(?=\s*\u3000|\s{2,}|\n|$)'
 
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
@@ -45,7 +44,7 @@ if "trans_status" not in st.session_state: st.session_state.trans_status = {}
 if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
         "api_keys": {"gemini": ""},
-        "selected_model": "Gemini 2.5 Flash (Ổn định, Cực nhanh)",
+        "selected_model": "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
         "raw_docs": [],
         "raw_chapters": {},
         "trans_prompt": "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Dịch mượt mà, thuần Việt, giữ nguyên đoạn văn và không tự ý thêm bớt tình tiết."
@@ -55,7 +54,7 @@ if "is_translating" not in st.session_state:
     st.session_state.is_translating = False
 
 # ==========================================
-# 2. HÀM TÁCH CHƯƠNG THÔNG MINH (CHỐNG LỖI RAW DÍNH CHỮ)
+# 2. HÀM TÁCH CHƯƠNG THÔNG MINH
 # ==========================================
 def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, str]]:
     reg = custom_regex.strip() if custom_regex and custom_regex.strip() else DEFAULT_SPLIT_REGEX
@@ -76,7 +75,6 @@ def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, 
             chapters.append(("Phần Mở Đầu / Tiền Truyện", intro_content))
             
     for i, match in enumerate(matches):
-        # Lấy an toàn group(1) nếu có, tránh nuốt các khoảng trắng vô dụng
         if len(match.groups()) > 0 and match.group(1):
             raw_title = match.group(1).strip()
         else:
@@ -88,7 +86,6 @@ def smart_split_novel(raw_text: str, custom_regex: str = "") -> list[tuple[str, 
         
         safe_title = re.sub(r'[\r\n\u3000\t]+', ' ', raw_title)[:60].strip()
         
-        # Chỉ lấy các chương thực sự có nội dung
         if len(re.sub(r'[\s\u3000\r\n]+', '', content)) > 0:
             chapters.append((safe_title, content))
             
@@ -146,7 +143,93 @@ def export_zip_archive(chapters_dict: dict) -> bytes:
                 zip_file.writestr(f"{i+1:03d}_{safe_filename}.txt", f"{k}\n\n{translated}")
     return zip_buffer.getvalue()
 
-# --- HÀM CALL API TỐC ĐỘ CAO KÈM TIMEOUT & TỰ ĐỘNG THỬ LẠI ---
+def parse_zhihu_content(soup):
+    texts = []
+    script_tag = soup.find('script', id='js-initialData')
+    if script_tag and script_tag.string:
+        try:
+            data = json.loads(script_tag.string)
+            initial_state = data.get('initialState', {})
+            entities = initial_state.get('entities', {})
+            articles = entities.get('articles', {})
+            for item_id, item_data in articles.items():
+                if 'content' in item_data:
+                    c_soup = BeautifulSoup(item_data['content'], 'html.parser')
+                    texts.append(c_soup.get_text(separator="\n", strip=True))
+                    
+            if not texts:
+                str_data = json.dumps(initial_state, ensure_ascii=False)
+                found_contents = re.findall(r'"content"\s*:\s*"([^"]+)"', str_data)
+                for fc in found_contents:
+                    if len(fc) > 200:
+                        c_soup = BeautifulSoup(fc.encode().decode('unicode-escape', errors='ignore'), 'html.parser')
+                        texts.append(c_soup.get_text(separator="\n", strip=True))
+        except Exception: pass
+
+    if not texts:
+        content_nodes = soup.find_all(['div', 'section', 'article'], class_=re.compile(r'(Post-RichText|BodyModule|css-1y8291e|PaidColumn)', re.IGNORECASE))
+        for node in content_nodes:
+            txt = node.get_text(separator="\n", strip=True)
+            if len(txt) > 100: texts.append(txt)
+
+    if not texts:
+        ps = soup.find_all('p')
+        if len(ps) > 5: texts = [p.get_text().strip() for p in ps if p.get_text().strip()]
+
+    return "\n\n".join(texts) if texts else ""
+
+def scrape_zhihu_url(url, custom_cookie=""):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+        }
+        cookie_val = custom_cookie.strip()
+        if cookie_val:
+            if cookie_val.startswith('[') and cookie_val.endswith(']'):
+                try:
+                    cookie_list = json.loads(cookie_val)
+                    cookie_val = "; ".join([f"{c['name']}={c['value']}" for c in cookie_list if 'name' in c and 'value' in c])
+                except Exception: pass
+            headers['Cookie'] = cookie_val
+
+        res = requests.get(url, headers=headers, timeout=15)
+        res.encoding = res.apparent_encoding
+        res.raise_for_status() 
+        soup = BeautifulSoup(res.text, 'html.parser')
+        text = parse_zhihu_content(soup)
+        return text if len(text) >= 50 else None, None
+    except Exception as e: 
+        return None, str(e)
+
+def scrape_web_chapter(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url.strip(), headers=headers, timeout=10)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        title_tag = soup.find('h1')
+        title = title_tag.get_text().strip() if title_tag else ""
+        if not title and soup.title: title = soup.title.string.strip()
+        if not title: title = "Chương Web Mới"
+
+        content_div = soup.select_one('#chapter-c, .chapter-content, #chapter-content, .box-chap, .story-detail-content')
+        if content_div:
+            paragraphs = content_div.find_all('p')
+            if paragraphs: text = "\n".join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
+            else: text = content_div.get_text(separator="\n", strip=True)
+        else:
+            paragraphs = soup.find_all('p')
+            if paragraphs and len(paragraphs) > 5: text = "\n".join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
+            else: text = soup.get_text(separator="\n", strip=True)
+                
+        return title, text if len(text) > 50 else "Không tìm thấy nội dung truyện ở link này."
+    except Exception as e: 
+        return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
+
+# --- HÀM CALL API FAST-FAIL (KHÔNG TREO, KHÔNG ĐỢI LÂU) ---
 def _single_api_call(api_key, model_name, system_prompt, prompt_text):
     client = genai.Client(api_key=api_key)
     safety_settings = [
@@ -168,43 +251,56 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    if "3.7 Flash" in str(model_choice):
-        models_to_try = ["gemini-3.7-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-    elif "3.6 Flash" in str(model_choice):
-        models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    # Rút gọn danh sách model để tránh quét vô ích gây treo
+    if "3.7" in str(model_choice) or "3.6" in str(model_choice):
+        models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     elif "2.5 Pro" in str(model_choice):
-        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash"]
+        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     else:
         models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
     last_error = ""
+    
     for current_key in gemini_keys:
+        key_exhausted = False
+        
         for model_name in models_to_try:
-            for retry_attempt in range(2): 
-                try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                        future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                        result_text = future.result(timeout=40)
-                        if result_text:
-                            return True, result_text
-                        else:
-                            last_error = f"Model {model_name} trả về rỗng."
-                except concurrent.futures.TimeoutError:
-                    last_error = f"API Timeout tại model {model_name}."
-                    time.sleep(1.5)
-                    continue
-                except Exception as e:
-                    err_str = str(e)
-                    last_error = f"{model_name}: {err_str}"
-                    if "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
-                        time.sleep(2.0)
-                        break 
-                    elif "404" in err_str or "not found" in err_str.lower():
-                        break 
-                    elif "quota" in err_str.lower() or "exhausted" in err_str.lower():
-                        break 
+            if key_exhausted:
+                break 
+                
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
+                    # ÉP TIMEOUT XUỐNG 25s (Không để kẹt mạng)
+                    result_text = future.result(timeout=25)
+                    if result_text:
+                        return True, result_text
+                    else:
+                        last_error = f"[{model_name}] Trả về rỗng."
+            except concurrent.futures.TimeoutError:
+                last_error = f"[{model_name}] Bị treo (Timeout > 25s)."
+                continue # Nếu kẹt mạng, ngay lập tức bỏ qua và thử model khác
+            except Exception as e:
+                err_str = str(e)
+                last_error = f"[{model_name}] Lỗi: {err_str}"
+                
+                # Chuyển key nếu hết hạn mức
+                if "429" in err_str or "quota" in err_str.lower() or "exhausted" in err_str.lower():
+                    key_exhausted = True
+                    break 
                     
-    return False, f"Lỗi API: {last_error}"
+                # Quá tải thì nghỉ xíu rồi nhảy model khác luôn
+                elif "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
+                    time.sleep(1.0)
+                    continue 
+                    
+                # Model không tồn tại, bỏ qua ngay
+                elif "404" in err_str or "not found" in err_str.lower():
+                    continue 
+                else:
+                    continue 
+                        
+    return False, f"Thất bại sau khi thử các model: {last_error}"
 
 def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_data_dict, trans_status_dict, custom_prompt=None):
     base_prompt = custom_prompt if custom_prompt else novel_data_dict.get("trans_prompt", "Bạn là dịch giả.")
@@ -216,8 +312,8 @@ def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_dat
         trans_status_dict[chap_key] = "✅ Hoàn thành"
         return True
     else:
-        novel_data_dict["raw_chapters"][chap_key]["translated"] = f"❌ Lỗi: {result}"
-        trans_status_dict[chap_key] = f"❌ Lỗi: {result[:30]}"
+        novel_data_dict["raw_chapters"][chap_key]["translated"] = f"❌ {result}"
+        trans_status_dict[chap_key] = f"❌ Lỗi (Xem bên dưới)"
         return False
 
 # ==========================================
@@ -267,10 +363,11 @@ if menu == "1. Cấu hình API":
     )
     
     model_options = [
+        "Gemini 3.7 Flash (Thử nghiệm)",
+        "Gemini 3.6 Flash (Thử nghiệm)",
         "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
         "Gemini 2.0 Flash (Tốc Độ Cao, Ít Nghẽn 503)",
         "Gemini 2.5 Pro (Văn Phong Mượt Mà)",
-        "Gemini 3.7 Flash (Thử nghiệm)"
     ]
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
@@ -286,7 +383,7 @@ if menu == "1. Cấu hình API":
 # --- MENU 2: NGUỒN TRUYỆN ---
 elif menu == "2. Nguồn Truyện":
     st.subheader("📂 Tải lên hoặc Quản Lý File Raw (.txt)")
-    uploaded_file = st.file_uploader("Tải lên file tiểu thuyết tiếng Trung (.txt)", type=["txt"], key="txt_uploader_v2")
+    uploaded_file = st.file_uploader("Tải lên file tiểu thuyết tiếng Trung (.txt)", type=["txt"], key="txt_uploader_v5")
     
     if uploaded_file is not None:
         existing_filenames = [d["filename"] for d in st.session_state.novel_data.get("raw_docs", [])]
@@ -307,8 +404,7 @@ elif menu == "2. Nguồn Truyện":
         
         st.info(f"File **{selected_doc_name}** đang có khoảng {len(selected_doc['content'])} ký tự.")
         
-        # ĐỔI KEY ở đây để ép giao diện quên cái Regex cũ bị lỗi
-        regex_split = st.text_input("Regex Tách Chương (Đã được làm lại chống dính chữ):", value=DEFAULT_SPLIT_REGEX, key="regex_split_v2")
+        regex_split = st.text_input("Regex Tách Chương (Đã được làm lại chống dính chữ):", value=DEFAULT_SPLIT_REGEX, key="regex_split_v5")
         
         if st.button("✂️ Bắt đầu Tách Chương từ File này", use_container_width=True):
             raw_text = selected_doc["content"]
@@ -343,8 +439,8 @@ elif menu == "3. Dịch & Quản Lý":
         tab_up, tab_paste = st.tabs(["📁 Tải File .txt lên", "✍️ Dán Raw thủ công"])
         
         with tab_up:
-            direct_file = st.file_uploader("Chọn file .txt cần đưa vào hàng chờ:", type=["txt"], key="direct_txt_uploader_v2")
-            direct_regex = st.text_input("Regex nhận diện tiêu đề chương:", value=DEFAULT_SPLIT_REGEX, key="direct_reg_v2")
+            direct_file = st.file_uploader("Chọn file .txt cần đưa vào hàng chờ:", type=["txt"], key="direct_txt_uploader_v5")
+            direct_regex = st.text_input("Regex nhận diện tiêu đề chương:", value=DEFAULT_SPLIT_REGEX, key="direct_reg_v5")
             auto_split_opt = st.checkbox("Tự động nhận diện và tách chương", value=True)
             
             if st.button("🚀 Nạp và Tách Chương Vào Hàng Chờ", key="btn_load_file_direct", use_container_width=True):
