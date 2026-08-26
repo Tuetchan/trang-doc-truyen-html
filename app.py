@@ -229,7 +229,6 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM CALL API (ĐÃ TĂNG THỜI GIAN CHỜ LÊN 90 GIÂY) ---
 def _single_api_call(api_key, model_name, system_prompt, prompt_text):
     client = genai.Client(api_key=api_key)
     safety_settings = [
@@ -251,10 +250,11 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
+    # CHỈ DÙNG CÁC BẢN MỚI, KHÔNG DÙNG 2.5 NỮA VÌ ĐÃ BỊ GOOGLE KHAI TỬ
     if "3.7" in str(model_choice):
         models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash"]
     else:
-        models_to_try = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
+        models_to_try = ["gemini-3.6-flash"]
 
     last_error = ""
     
@@ -268,7 +268,6 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                    # ÉP TIMEOUT XUỐNG 90s (1.5 phút) thay vì 25s như cũ
                     result_text = future.result(timeout=90)
                     if result_text:
                         return True, result_text
@@ -276,24 +275,21 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
                         last_error = f"[{model_name}] Trả về rỗng."
             
             except concurrent.futures.TimeoutError:
-                # SỬA Ở ĐÂY: Dừng lại ngay lập tức và báo đúng lỗi 90 giây
                 return False, f"Lỗi: Treo quá 90s (1 phút rưỡi). Đoạn chữ quá dài nên AI chưa kịp dịch xong, hoặc mạng quá yếu."
                 
             except Exception as e:
                 err_str = str(e)
                 last_error = f"[{model_name}] Lỗi: {err_str}"
                 
-                # Chuyển key nếu hết hạn mức
                 if "429" in err_str or "quota" in err_str.lower() or "exhausted" in err_str.lower():
                     key_exhausted = True
                     break 
                     
-                # Quá tải thì nghỉ xíu rồi nhảy model khác
+                # NẾU QUÁ TẢI (503), nghỉ 3 giây rồi thử lại luôn bản mới, KHÔNG nhảy sang 2.5 nữa
                 elif "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
-                    time.sleep(1.0)
+                    time.sleep(3.0)
                     continue 
                     
-                # Model không tồn tại, bỏ qua ngay
                 elif "404" in err_str or "not found" in err_str.lower():
                     continue 
                 else:
@@ -363,8 +359,7 @@ if menu == "1. Cấu hình API":
     
     model_options = [
         "Gemini 3.6 Flash (Khuyên Dùng - Bản Mới Nhất)",
-        "Gemini 3.7 Flash (Thử nghiệm)",
-        "Gemini 2.5 Flash (Dự phòng)"
+        "Gemini 3.7 Flash (Thử nghiệm)"
     ]
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
