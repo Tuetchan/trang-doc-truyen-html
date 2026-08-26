@@ -229,7 +229,7 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM CALL API ĐÃ ĐƯỢC LÀM MỚI ---
+# --- HÀM CALL API (ĐÃ TĂNG THỜI GIAN CHỜ LÊN 90 GIÂY) ---
 def _single_api_call(api_key, model_name, system_prompt, prompt_text):
     client = genai.Client(api_key=api_key)
     safety_settings = [
@@ -251,7 +251,6 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    # Ưu tiên tập trung vào các Model mới nhất như bạn yêu cầu
     if "3.7" in str(model_choice):
         models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash"]
     else:
@@ -269,16 +268,16 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                    # ÉP TIMEOUT XUỐNG 25s
-                    result_text = future.result(timeout=25)
+                    # ÉP TIMEOUT XUỐNG 90s (1.5 phút) thay vì 25s như cũ
+                    result_text = future.result(timeout=90)
                     if result_text:
                         return True, result_text
                     else:
                         last_error = f"[{model_name}] Trả về rỗng."
             
             except concurrent.futures.TimeoutError:
-                # SỬA Ở ĐÂY: Dừng lại ngay lập tức thay vì thử tiếp, chống kẹt 2-3 phút
-                return False, f"Lỗi mạng: Treo API quá 25s (Có thể Google chặn IP mạng bạn đang dùng). Hãy bật VPN."
+                # SỬA Ở ĐÂY: Dừng lại ngay lập tức và báo đúng lỗi 90 giây
+                return False, f"Lỗi: Treo quá 90s (1 phút rưỡi). Đoạn chữ quá dài nên AI chưa kịp dịch xong, hoặc mạng quá yếu."
                 
             except Exception as e:
                 err_str = str(e)
@@ -433,7 +432,7 @@ elif menu == "2. Nguồn Truyện":
 elif menu == "3. Dịch & Quản Lý":
     st.header("⏳ Hàng chờ & Dịch Thuật")
     
-    with st.expander("📥 Tải File Raw Hoặc Dán Text Trực Tiếp Tại Đây", expanded=False):
+    with st.expander("📥 Tải File Raw Hoặc Dán Text Trực trực tiếp tại đây", expanded=False):
         tab_up, tab_paste = st.tabs(["📁 Tải File .txt lên", "✍️ Dán Raw thủ công"])
         
         with tab_up:
