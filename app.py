@@ -44,7 +44,7 @@ if "trans_status" not in st.session_state: st.session_state.trans_status = {}
 if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
         "api_keys": {"gemini": ""},
-        "selected_model": "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
+        "selected_model": "Gemini 3.6 Flash (Khuyên Dùng - Bản Mới Nhất)",
         "raw_docs": [],
         "raw_chapters": {},
         "trans_prompt": "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Dịch mượt mà, thuần Việt, giữ nguyên đoạn văn và không tự ý thêm bớt tình tiết."
@@ -229,7 +229,7 @@ def scrape_web_chapter(url):
     except Exception as e: 
         return "Lỗi", f"❌ Lỗi cào web: {str(e)}"
 
-# --- HÀM CALL API FAST-FAIL (KHÔNG TREO, KHÔNG ĐỢI LÂU) ---
+# --- HÀM CALL API ĐÃ ĐƯỢC LÀM MỚI ---
 def _single_api_call(api_key, model_name, system_prompt, prompt_text):
     client = genai.Client(api_key=api_key)
     safety_settings = [
@@ -251,13 +251,11 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    # Rút gọn danh sách model để tránh quét vô ích gây treo
-    if "3.7" in str(model_choice) or "3.6" in str(model_choice):
-        models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    elif "2.5 Pro" in str(model_choice):
-        models_to_try = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # Ưu tiên tập trung vào các Model mới nhất như bạn yêu cầu
+    if "3.7" in str(model_choice):
+        models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash"]
     else:
-        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        models_to_try = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
 
     last_error = ""
     
@@ -271,15 +269,17 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                    # ÉP TIMEOUT XUỐNG 25s (Không để kẹt mạng)
+                    # ÉP TIMEOUT XUỐNG 25s
                     result_text = future.result(timeout=25)
                     if result_text:
                         return True, result_text
                     else:
                         last_error = f"[{model_name}] Trả về rỗng."
+            
             except concurrent.futures.TimeoutError:
-                last_error = f"[{model_name}] Bị treo (Timeout > 25s)."
-                continue # Nếu kẹt mạng, ngay lập tức bỏ qua và thử model khác
+                # SỬA Ở ĐÂY: Dừng lại ngay lập tức thay vì thử tiếp, chống kẹt 2-3 phút
+                return False, f"Lỗi mạng: Treo API quá 25s (Có thể Google chặn IP mạng bạn đang dùng). Hãy bật VPN."
+                
             except Exception as e:
                 err_str = str(e)
                 last_error = f"[{model_name}] Lỗi: {err_str}"
@@ -289,7 +289,7 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
                     key_exhausted = True
                     break 
                     
-                # Quá tải thì nghỉ xíu rồi nhảy model khác luôn
+                # Quá tải thì nghỉ xíu rồi nhảy model khác
                 elif "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
                     time.sleep(1.0)
                     continue 
@@ -298,9 +298,9 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
                 elif "404" in err_str or "not found" in err_str.lower():
                     continue 
                 else:
-                    continue 
+                    break 
                         
-    return False, f"Thất bại sau khi thử các model: {last_error}"
+    return False, f"Thất bại: {last_error}"
 
 def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_data_dict, trans_status_dict, custom_prompt=None):
     base_prompt = custom_prompt if custom_prompt else novel_data_dict.get("trans_prompt", "Bạn là dịch giả.")
@@ -363,11 +363,9 @@ if menu == "1. Cấu hình API":
     )
     
     model_options = [
+        "Gemini 3.6 Flash (Khuyên Dùng - Bản Mới Nhất)",
         "Gemini 3.7 Flash (Thử nghiệm)",
-        "Gemini 3.6 Flash (Thử nghiệm)",
-        "Gemini 2.5 Flash (Khuyên Dùng - Cực Ổn Định)",
-        "Gemini 2.0 Flash (Tốc Độ Cao, Ít Nghẽn 503)",
-        "Gemini 2.5 Pro (Văn Phong Mượt Mà)",
+        "Gemini 2.5 Flash (Dự phòng)"
     ]
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
