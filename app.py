@@ -45,6 +45,7 @@ if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
         "api_keys": {"gemini": ""},
         "selected_model": "Gemini 3.6 Flash (Khuyên Dùng - Bản Mới Nhất)",
+        "batch_size": 3, # Mặc định dịch 3 chương cùng lúc
         "raw_docs": [],
         "raw_chapters": {},
         "trans_prompt": "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Dịch mượt mà, thuần Việt, giữ nguyên đoạn văn và không tự ý thêm bớt tình tiết."
@@ -250,7 +251,6 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
     if not gemini_keys: 
         return False, "Chưa nhập Gemini API Key."
     
-    # CHỈ DÙNG CÁC BẢN MỚI, KHÔNG DÙNG 2.5 NỮA VÌ ĐÃ BỊ GOOGLE KHAI TỬ
     if "3.7" in str(model_choice):
         models_to_try = ["gemini-3.7-flash", "gemini-3.6-flash"]
     else:
@@ -268,14 +268,15 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                     future = ex.submit(_single_api_call, current_key, model_name, system_prompt, prompt_text)
-                    result_text = future.result(timeout=90)
+                    # Nâng timeout lên 120 giây để tránh lỗi file dài
+                    result_text = future.result(timeout=120) 
                     if result_text:
                         return True, result_text
                     else:
                         last_error = f"[{model_name}] Trả về rỗng."
             
             except concurrent.futures.TimeoutError:
-                return False, f"Lỗi: Treo quá 90s (1 phút rưỡi). Đoạn chữ quá dài nên AI chưa kịp dịch xong, hoặc mạng quá yếu."
+                return False, f"Lỗi: Treo quá 120s (2 phút). Đoạn chữ quá dài nên AI chưa kịp dịch xong, hoặc mạng quá yếu."
                 
             except Exception as e:
                 err_str = str(e)
@@ -285,7 +286,6 @@ def call_llm(system_prompt, prompt_text, api_keys, model_choice) -> tuple[bool, 
                     key_exhausted = True
                     break 
                     
-                # NẾU QUÁ TẢI (503), nghỉ 3 giây rồi thử lại luôn bản mới, KHÔNG nhảy sang 2.5 nữa
                 elif "503" in err_str or "unavailable" in err_str.lower() or "high demand" in err_str.lower():
                     time.sleep(3.0)
                     continue 
@@ -364,8 +364,15 @@ if menu == "1. Cấu hình API":
     
     current_model = st.session_state.novel_data.get("selected_model", model_options[0])
     current_idx = model_options.index(current_model) if current_model in model_options else 0
-    
     st.session_state.novel_data["selected_model"] = st.selectbox("Lựa chọn Model Dịch:", model_options, index=current_idx)
+    
+    st.session_state.novel_data["batch_size"] = st.slider(
+        "Số chương dịch cùng lúc (Batch Size):", 
+        min_value=1, max_value=5, 
+        value=st.session_state.novel_data.get("batch_size", 3), 
+        help="Giảm xuống 1 hoặc 2 nếu dùng API miễn phí để tránh lỗi Quá tải (Rate Limit)."
+    )
+
     st.session_state.novel_data["trans_prompt"] = st.text_area("Prompt Dịch:", value=st.session_state.novel_data.get("trans_prompt", ""), height=100)
     
     if st.button("💾 Lưu Cấu Hình", use_container_width=True): 
@@ -374,19 +381,49 @@ if menu == "1. Cấu hình API":
 
 # --- MENU 2: NGUỒN TRUYỆN ---
 elif menu == "2. Nguồn Truyện":
-    st.subheader("📂 Tải lên hoặc Quản Lý File Raw (.txt)")
-    uploaded_file = st.file_uploader("Tải lên file tiểu thuyết tiếng Trung (.txt)", type=["txt"], key="txt_uploader_v5")
+    st.subheader("📂 Tải Lên Hoặc Cào Truyện Trực Tuyến")
     
-    if uploaded_file is not None:
-        existing_filenames = [d["filename"] for d in st.session_state.novel_data.get("raw_docs", [])]
-        if uploaded_file.name not in existing_filenames:
-            content = uploaded_file.read().decode('utf-8', errors='ignore')
-            st.session_state.novel_data["raw_docs"].append({"filename": uploaded_file.name, "content": content})
-            save_user_data_to_supabase()
-            st.success(f"✅ Tải lên {uploaded_file.name} thành công!")
-            time.sleep(1)
-            st.rerun()
+    tab_upload, tab_crawl = st.tabs(["📁 Tải file Raw (.txt)", "🌐 Cào truyện từ Web (Zhihu/Khác)"])
+    
+    with tab_upload:
+        uploaded_file = st.file_uploader("Tải lên file tiểu thuyết tiếng Trung (.txt)", type=["txt"], key="txt_uploader_v5")
+        if uploaded_file is not None:
+            existing_filenames = [d["filename"] for d in st.session_state.novel_data.get("raw_docs", [])]
+            if uploaded_file.name not in existing_filenames:
+                content = uploaded_file.read().decode('utf-8', errors='ignore')
+                st.session_state.novel_data["raw_docs"].append({"filename": uploaded_file.name, "content": content})
+                save_user_data_to_supabase()
+                st.success(f"✅ Tải lên {uploaded_file.name} thành công!")
+                time.sleep(1)
+                st.rerun()
+
+    with tab_crawl:
+        st.markdown("Hỗ trợ tự động cào nội dung từ Zhihu (Kể cả bài VIP trả phí) và các trang web truyện thông thường.")
+        url_input = st.text_input("🔗 Nhập Link truyện (URL):")
+        cookie_input = st.text_area("🍪 Cookie Zhihu dạng JSON (Tùy chọn, dùng cho truyện VIP trả phí):", help="Sử dụng tiện ích EditThisCookie trên Chrome để xuất Cookie dạng JSON dán vào đây.")
         
+        if st.button("⬇️ Cào Dữ Liệu", use_container_width=True, type="primary"):
+            if not url_input.strip():
+                st.warning("Vui lòng nhập Link truyện!")
+            else:
+                with st.spinner("Đang kết nối để tải nội dung..."):
+                    if "zhihu.com" in url_input.lower():
+                        content, err = scrape_zhihu_url(url_input, cookie_input)
+                        title = f"Zhihu_{datetime.now().strftime('%H%M%S')}"
+                    else:
+                        title, content = scrape_web_chapter(url_input)
+                        err = None if content and "Lỗi cào web" not in content else content
+                    
+                    if err or not content:
+                        st.error(f"❌ Không thể tải truyện: {err or 'Nội dung rỗng'}")
+                    else:
+                        file_name = f"{title}.txt"
+                        st.session_state.novel_data["raw_docs"].append({"filename": file_name, "content": content})
+                        save_user_data_to_supabase()
+                        st.success(f"✅ Đã cào truyện thành công! File '{file_name}' đã được thêm vào danh sách bên dưới.")
+                        time.sleep(1.5)
+                        st.rerun()
+
     if st.session_state.novel_data.get("raw_docs"):
         st.write("---")
         st.write("### 📚 Danh sách File Raw hiện có:")
@@ -403,7 +440,7 @@ elif menu == "2. Nguồn Truyện":
             extracted_chapters = smart_split_novel(raw_text, regex_split)
             
             if not extracted_chapters: 
-                st.warning("Không tìm thấy chương nào theo quy tắc Regex trên!")
+                st.warning("Không tìm thấy chương nào theo quy tắc Regex trên! Hãy kiểm tra lại nội dung truyện.")
             else:
                 if "raw_chapters" not in st.session_state.novel_data: 
                     st.session_state.novel_data["raw_chapters"] = {}
@@ -414,7 +451,7 @@ elif menu == "2. Nguồn Truyện":
                     st.session_state.trans_status[chap_name] = "⏳ Đợi Dịch"
                     
                 save_user_data_to_supabase()
-                st.success(f"✅ Đã tách chính xác {len(extracted_chapters)} chương!")
+                st.success(f"✅ Đã tách chính xác {len(extracted_chapters)} chương và đưa vào Hàng Chờ Dịch!")
                 time.sleep(1)
                 st.rerun()
 
@@ -525,7 +562,8 @@ elif menu == "3. Dịch & Quản Lý":
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
                 
-                batch_size = 3
+                # Lấy batch_size từ cấu hình (mặc định là 3 nếu chưa có)
+                batch_size = st.session_state.novel_data.get("batch_size", 3)
                 total_batches = (len(keys_to_translate) + batch_size - 1) // batch_size
                 completed_count = 0
                 
