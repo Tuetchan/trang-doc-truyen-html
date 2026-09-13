@@ -11,23 +11,39 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="Công Cụ Cào Raw Truyện", page_icon="🌐", layout="wide")
 
 # ==========================================
-# HÀM XỬ LÝ LỖI FONT CHỮ (CỐT LÕI)
+# HÀM XỬ LÝ LỖI FONT CHỮ VÀ DỌN DẸP TEXT
 # ==========================================
 def decode_chinese_text(response_content):
-    """
-    Hàm này ép giải mã byte thô thành text, 
-    trị triệt để lỗi giun dế của web Trung Quốc.
-    """
+    """Ép giải mã byte thô thành text, trị lỗi giun dế."""
     try:
-        # Ưu tiên 1: Chuẩn quốc tế UTF-8
         return response_content.decode('utf-8')
     except UnicodeDecodeError:
         try:
-            # Ưu tiên 2: Chuẩn nội địa Trung Quốc GBK / GB2312
             return response_content.decode('gbk')
         except UnicodeDecodeError:
-            # Ưu tiên 3: Ép giải mã UTF-8 và bỏ qua các ký tự bị hỏng
             return response_content.decode('utf-8', errors='ignore')
+
+def html_to_clean_text(soup_obj):
+    """
+    Dọn dẹp HTML thông minh: Chỉ xuống dòng ở thẻ <p>, <div>, <br>
+    Tránh tình trạng các dấu câu (dấu phẩy, dấu chấm) bị rớt dòng riêng lẻ.
+    """
+    # Đổi <br> thành ký tự xuống dòng
+    for br in soup_obj.find_all("br"):
+        br.replace_with("\n")
+    
+    # Thêm ký tự xuống dòng vào cuối các thẻ khối (block tags)
+    for tag in soup_obj.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']):
+        tag.append('\n')
+        
+    # Lấy text thô (không dùng separator để giữ các thẻ span, b, i dính liền nhau)
+    raw_text = soup_obj.get_text(strip=False)
+    
+    # Xóa khoảng trắng thừa và dòng trống
+    lines = [line.strip() for line in raw_text.split('\n')]
+    clean_text = "\n".join([line for line in lines if line])
+    
+    return clean_text
 
 # ==========================================
 # HÀM CÀO DỮ LIỆU
@@ -55,19 +71,20 @@ def parse_zhihu_content(soup):
             
             for html_content in raw_contents:
                 c_soup = BeautifulSoup(html_content, 'html.parser')
-                texts.append(c_soup.get_text(separator="\n", strip=True))
+                texts.append(html_to_clean_text(c_soup))
         except Exception: 
             pass
 
     if not texts:
         content_nodes = soup.find_all(['div', 'section', 'article'], class_=re.compile(r'(Post-RichText|BodyModule|css-1y8291e|PaidColumn)', re.IGNORECASE))
         for node in content_nodes:
-            txt = node.get_text(separator="\n", strip=True)
+            txt = html_to_clean_text(node)
             if len(txt) > 100: texts.append(txt)
 
     if not texts:
         ps = soup.find_all('p')
-        if len(ps) > 5: texts = [p.get_text().strip() for p in ps if p.get_text().strip()]
+        if len(ps) > 5: 
+            texts = [p.get_text(strip=True) for p in ps if p.get_text(strip=True)]
 
     return "\n\n".join(texts) if texts else ""
 
@@ -90,7 +107,6 @@ def scrape_zhihu_url(url, custom_cookie=""):
         res = requests.get(url, headers=headers, timeout=15)
         res.raise_for_status() 
         
-        # Áp dụng bộ giải mã chống lỗi font
         html_text = decode_chinese_text(res.content)
         soup = BeautifulSoup(html_text, 'html.parser')
         
@@ -105,7 +121,6 @@ def scrape_web_chapter(url):
         res = requests.get(url.strip(), headers=headers, timeout=15)
         res.raise_for_status()
         
-        # Áp dụng bộ giải mã chống lỗi font
         html_text = decode_chinese_text(res.content)
         soup = BeautifulSoup(html_text, 'html.parser')
         
@@ -116,13 +131,13 @@ def scrape_web_chapter(url):
 
         content_div = soup.select_one('#chapter-c, .chapter-content, #chapter-content, .box-chap, .story-detail-content, .read-content')
         if content_div:
-            paragraphs = content_div.find_all('p')
-            if paragraphs: text = "\n".join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
-            else: text = content_div.get_text(separator="\n", strip=True)
+            text = html_to_clean_text(content_div)
         else:
-            paragraphs = soup.find_all('p')
-            if paragraphs and len(paragraphs) > 5: text = "\n".join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
-            else: text = soup.get_text(separator="\n", strip=True)
+            ps = soup.find_all('p')
+            if ps and len(ps) > 5: 
+                text = "\n".join([p.get_text(strip=True) for p in ps if p.get_text(strip=True)])
+            else: 
+                text = html_to_clean_text(soup)
                 
         return title, text if len(text) > 50 else "Không tìm thấy nội dung truyện ở link này."
     except Exception as e: 
@@ -131,8 +146,8 @@ def scrape_web_chapter(url):
 # ==========================================
 # GIAO DIỆN CHÍNH
 # ==========================================
-st.title("🌐 Công Cụ Cào Raw Truyện (Chống Lỗi Font)")
-st.markdown("Hỗ trợ cào nội dung từ **Zhihu** và **các web truyện thông thường**, tự động nhận diện và sửa lỗi mã hóa tiếng Trung.")
+st.title("🌐 Công Cụ Cào Raw Truyện (Chống Lỗi Font & Fix Ngắt Dòng)")
+st.markdown("Hỗ trợ cào nội dung từ **Zhihu** và **các web truyện thông thường**, tự động giữ nguyên vẹn câu văn và đoạn văn.")
 
 url_input = st.text_input("🔗 Nhập Link truyện (URL):")
 cookie_input = st.text_area("🍪 Cookie Zhihu dạng JSON (Tùy chọn):", help="Nếu cào web thường thì bỏ trống.")
@@ -141,7 +156,7 @@ if st.button("⬇️ Cào Dữ Liệu", use_container_width=True, type="primary"
     if not url_input.strip():
         st.warning("Vui lòng nhập Link truyện!")
     else:
-        with st.spinner("Đang kết nối và xử lý font chữ..."):
+        with st.spinner("Đang kết nối và dọn dẹp văn bản..."):
             if "zhihu.com" in url_input.lower():
                 content, err = scrape_zhihu_url(url_input, cookie_input)
                 title = f"Zhihu_{datetime.now().strftime('%H%M%S')}"
@@ -152,7 +167,7 @@ if st.button("⬇️ Cào Dữ Liệu", use_container_width=True, type="primary"
             if err or not content:
                 st.error(f"❌ Cào thất bại: {err or 'Nội dung rỗng'}")
             else:
-                st.success("✅ Cào thành công! Chữ tiếng Trung đã được xử lý chuẩn.")
+                st.success("✅ Cào thành công! Văn bản đã được xếp lại ngay ngắn.")
                 st.session_state['scraped_title'] = title
                 st.session_state['scraped_content'] = content
 
@@ -166,7 +181,6 @@ if 'scraped_content' in st.session_state:
     
     st.subheader(f"📄 {title}")
     
-    # Định dạng utf-8-sig giúp Notepad mở tiếng Trung không bao giờ bị lỗi
     st.download_button(
         label="💾 Tải Raw Xuống File (.txt)",
         data=content.encode('utf-8-sig'),
