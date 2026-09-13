@@ -38,8 +38,7 @@ supabase = init_supabase()
 # Regex xử lý sạch khoảng trắng tiếng Trung
 DEFAULT_SPLIT_REGEX = r'(?:^|(?<=[。！？】”’"\'\s]))((?:【[^】\n]+】|(?:☆\s*、\s*)?(?:第\s*[0-9一二三四五六七八九十百千万零]+\s*[章回节集卷部]|(?:Chapter|Chương)\s*[0-9]+|[0-9]{1,5}\s*[、.．:：\s]))[^\u3000\r\n]{0,40}?)(?=\s*\u3000|\s{2,}|\n|$)'
 
-if "authenticated" not in st.session_state: st.session_state.authenticated = False
-if "user_email" not in st.session_state: st.session_state.user_email = ""
+# Khởi tạo các biến session_state
 if "trans_status" not in st.session_state: st.session_state.trans_status = {}
 if "novel_data" not in st.session_state:
     st.session_state.novel_data = {
@@ -107,7 +106,8 @@ def load_user_data_from_supabase(email):
             st.error(f"Lỗi tải dữ liệu: {e}")
 
 def save_user_data_to_supabase():
-    if supabase and st.session_state.authenticated and st.session_state.user_email:
+    # Vẫn giữ hàm này nhưng chỉ lưu khi có user_email (nếu bạn dùng tích hợp hệ thống khác sau này)
+    if supabase and st.session_state.get("user_email"):
         try:
             supabase.table("workspaces").upsert({"email": st.session_state.user_email, "workspace_data": st.session_state.novel_data}).execute()
         except Exception: 
@@ -117,7 +117,7 @@ def reset_all_chapters():
     st.session_state.novel_data["raw_chapters"] = {}
     st.session_state.trans_status = {}
     st.session_state.is_translating = False
-    if supabase and st.session_state.user_email:
+    if supabase and st.session_state.get("user_email"):
         try:
             supabase.table("workspaces").upsert({
                 "email": st.session_state.user_email, 
@@ -311,42 +311,15 @@ def process_single_chapter(chap_key, raw_text, api_keys, model_choice, novel_dat
         trans_status_dict[chap_key] = f"❌ Lỗi (Xem bên dưới)"
         return False
 
-# ==========================================
-# 4. GIAO DIỆN ĐĂNG NHẬP
-# ==========================================
-if not st.session_state.authenticated:
-    st.title("⚡ Máy Dịch Truyện - Tối Giản")
-    email = st.text_input("Email:")
-    password = st.text_input("Mật khẩu:", type="password")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🚀 Đăng nhập", use_container_width=True):
-            if supabase:
-                try:
-                    supabase.auth.sign_in_with_password({"email": email, "password": password})
-                    st.session_state.authenticated = True; st.session_state.user_email = email
-                    load_user_data_from_supabase(email)
-                    st.rerun()
-                except Exception as e: st.error(f"Lỗi: {e}")
-            else:
-                st.session_state.authenticated = True; st.session_state.user_email = email
-                st.rerun()
-    with col2:
-        if st.button("📝 Đăng ký", use_container_width=True):
-            if supabase:
-                try: supabase.auth.sign_up({"email": email, "password": password}); st.success("Đăng ký thành công!")
-                except Exception as e: st.error(f"Lỗi: {e}")
-    st.stop()
 
 # ==========================================
-# 5. GIAO DIỆN CHÍNH
+# 4. GIAO DIỆN CHÍNH (Đã xóa phần đăng nhập)
 # ==========================================
 st.sidebar.title("⚡ Menu")
 menu = st.sidebar.radio("Chọn chức năng:", ["1. Cấu hình API", "2. Nguồn Truyện", "3. Dịch & Quản Lý"])
-if st.sidebar.button("💾 Lưu Dữ Liệu"): 
+if st.sidebar.button("💾 Lưu Dữ Liệu Lên Session"): 
     save_user_data_to_supabase()
     st.toast("Lưu thành công!", icon="✅")
-if st.sidebar.button("🚪 Đăng xuất"): st.session_state.authenticated = False; st.rerun()
 
 # --- MENU 1: CẤU HÌNH API ---
 if menu == "1. Cấu hình API":
