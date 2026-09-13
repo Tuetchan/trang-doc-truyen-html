@@ -65,9 +65,10 @@ def scrape_zhihu_url(url, custom_cookie=""):
             headers['Cookie'] = cookie_val
 
         res = requests.get(url, headers=headers, timeout=15)
-        res.encoding = res.apparent_encoding
-        res.raise_for_status() 
-        soup = BeautifulSoup(res.text, 'html.parser')
+        res.raise_for_status()
+        
+        # FIX LỖI FONT: Ép BeautifulSoup xử lý từ byte thô (res.content) thay vì res.text
+        soup = BeautifulSoup(res.content, 'html.parser', from_encoding='utf-8')
         text = parse_zhihu_content(soup)
         return text if len(text) >= 50 else None, None
     except Exception as e: 
@@ -78,7 +79,11 @@ def scrape_web_chapter(url):
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url.strip(), headers=headers, timeout=10)
         res.raise_for_status()
-        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # FIX LỖI FONT: Một số web Trung Quốc dùng GBK hoặc UTF-8
+        # Dùng res.content giúp BeautifulSoup tự đọc thẻ meta charset để giải mã
+        res.encoding = res.apparent_encoding or 'utf-8' 
+        soup = BeautifulSoup(res.content, 'html.parser')
         
         title_tag = soup.find('h1')
         title = title_tag.get_text().strip() if title_tag else ""
@@ -124,7 +129,6 @@ if st.button("⬇️ Cào Dữ Liệu", use_container_width=True, type="primary"
                 st.error(f"❌ Không thể tải truyện: {err or 'Nội dung rỗng'}")
             else:
                 st.success("✅ Đã cào truyện thành công!")
-                # Lưu vào session để hiển thị và tải xuống
                 st.session_state['scraped_title'] = title
                 st.session_state['scraped_content'] = content
 
@@ -138,14 +142,12 @@ if 'scraped_content' in st.session_state:
     
     st.subheader(f"📄 {title}")
     
-    # Nút tải xuống
     st.download_button(
         label="💾 Tải Raw Xuống File (.txt)",
-        data=content.encode('utf-8'),
+        data=content.encode('utf-8-sig'), # Dùng utf-8-sig để Excel/Notepad Windows nhận diện đúng tiếng Trung
         file_name=f"{title}.txt",
         mime="text/plain",
         use_container_width=True
     )
     
-    # Text area để xem trước và copy thủ công nếu muốn
     st.text_area("Nội dung Raw (Xem trước):", content, height=400)
