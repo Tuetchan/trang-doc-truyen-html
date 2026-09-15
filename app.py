@@ -1,204 +1,160 @@
-import streamlit as st
-import requests
+import os
 import re
-import json
-from datetime import datetime
+import time
+from urllib.parse import urljoin
+import requests
 from bs4 import BeautifulSoup
+import streamlit as st
+
+st.set_page_config(page_title="Cào Truyện Hàng Loạt Theo Mục Lục", page_icon="📚", layout="wide")
 
 # ==========================================
-# CẤU HÌNH TRANG
+# CÁC HÀM XỬ LÝ TEXT VÀ MÃ HÓA
 # ==========================================
-st.set_page_config(page_title="Công Cụ Cào Raw Truyện Đa Năng", page_icon="🌐", layout="wide")
-
-# ==========================================
-# HÀM XỬ LÝ LỖI FONT CHỮ VÀ DỌN DẸP TEXT
-# ==========================================
-def decode_chinese_text(response_content):
-    """Ép giải mã byte thô thành text, hỗ trợ UTF-8, GBK và Big5 (cho blog Đài/Hồng Kông)."""
-    for enc in ['utf-8', 'gb18030', 'big5', 'gbk']:
+def decode_text(response_content):
+    for enc in ['utf-8', 'big5', 'gb18030', 'gbk']:
         try:
             return response_content.decode(enc)
         except UnicodeDecodeError:
             continue
     return response_content.decode('utf-8', errors='ignore')
 
-def clean_unwanted_elements(soup_obj):
-    """Loại bỏ thẻ rác, sidebar, menu điều hướng để tránh cào nhầm cột phụ."""
-    for element in soup_obj.find_all(['script', 'style', 'nav', 'aside', 'footer', 'header', 'noscript', 'iframe']):
-        element.decompose()
-        
-    # Xóa các class phổ biến của thanh bên (sidebar/menu/comment)
-    sidebar_pattern = re.compile(r'(sidebar|widget|comment|menu|nav|header|footer|paging)', re.IGNORECASE)
-    for tag in soup_obj.find_all(attrs={'class': sidebar_pattern}):
-        tag.decompose()
-    for tag in soup_obj.find_all(attrs={'id': sidebar_pattern}):
-        tag.decompose()
+def clean_file_name(filename):
+    """Xóa ký tự cấm đặt tên file trên Windows/Linux"""
+    return re.sub(r'[\\/*?:"<>|]', "", filename).strip()
 
 def html_to_clean_text(soup_obj):
-    """Dọn dẹp HTML thông minh: Giữ xuống dòng hợp lý, dính các thẻ inline."""
-    # Xử lý thẻ ngắt dòng
     for br in soup_obj.find_all("br"):
         br.replace_with("\n")
-    
-    # Xuống dòng sau các khối văn bản
-    for tag in soup_obj.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']):
+    for tag in soup_obj.find_all(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
         tag.append('\n')
-        
-    raw_text = soup_obj.get_text(strip=False)
-    lines = [line.strip() for line in raw_text.split('\n')]
-    return "\n".join([line for line in lines if line])
+    lines = [line.strip() for line in soup_obj.get_text(strip=False).split('\n')]
+    return "\n".join([l for l in lines if l])
 
 # ==========================================
-# HÀM TRÍCH XUẤT NỘI DUNG TỰ ĐỘNG THEO BỐ CỤC
+# 1. BÓC TÁCH MỤC LỤC CHƯƠNG (TỰ ĐỘNG)
 # ==========================================
-def extract_smart_content(soup):
-    """Tự động phát hiện cột nội dung chính (bên trái hoặc phải)."""
-    # 1. Các selector phổ biến của FC2 Blog, WordPress, Blogger, Web Raw
-    selectors = [
-        '.entry-body', '.entry_body', '.entry-content', '.entry_content', # FC2 / WP
-        '.post-body', '.post_body', 'article', 'main',                    # Blogger / Modern CMS
-        '#chapter-c', '.chapter-content', '#chapter-content',             # Web truyện Tàu
-        '.box-chap', '.story-detail-content', '.read-content',
-        '#article_content', '.content-body', '.txtnav'
-    ]
+def get_chapter_list(toc_url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'zh-TW,zh-CN,zh;q=0.9,en;q=0.7'
+    }
+    res = requests.get(toc_url.strip(), headers=headers, timeout=15)
+    res.raise_for_status()
     
-    for selector in selectors:
-        target = soup.select_one(selector)
-        if target:
-            text = html_to_clean_text(target)
-            if len(text) > 150:
-                return text
-
-    # 2. Thuật toán dự phòng: Quét toàn bộ các thẻ div/section để tìm thẻ có lượng text dài nhất
-    candidate_nodes = soup.find_all(['div', 'section', 'article'])
-    best_text = ""
-    max_len = 0
+    html = decode_text(res.content)
+    soup = BeautifulSoup(html, 'html.parser')
     
-    for node in candidate_nodes:
-        # Bỏ qua nếu là thẻ con nằm quá sâu hoặc chứa ít hơn 2 đoạn p
-        ps = node.find_all('p')
-        if len(ps) < 2 and len(node.get_text(strip=True)) < 200:
+    chapters = []
+    # Bộ lọc link chương: Tìm trong các thẻ mục lục điển hình (czbooks: .chapter-list, ul.nav, #chapters,...)
+    target_container = soup.select_one('.chapter-list, ul.chapter-list, #chapter-list, .chapters, .catalog')
+    container = target_container if target_container else soup
+    
+    # Lấy các thẻ a có dấu hiệu link chương
+    for a in container.find_all('a', href=True):
+        href = a['href']
+        name = a.get_text(strip=True)
+        # Bỏ qua link menu hoặc link rác ngắn/trùng lặp
+        if not name or len(name) < 2 or 'javascript' in href or href == '#':
             continue
-            
-        current_text = html_to_clean_text(node)
-        if len(current_text) > max_len:
-            max_len = len(current_text)
-            best_text = current_text
-            
-    if best_text and max_len > 100:
-        return best_text
-
-    # 3. Kế sách cuối cùng: gom tất cả thẻ p còn lại
-    paragraphs = [p.get_text(strip=True) for p in soup.find_all('p') if len(p.get_text(strip=True)) > 20]
-    return "\n\n".join(paragraphs) if paragraphs else ""
-
-# ==========================================
-# CÀO ZHIHU VÀ WEB TỔNG HỢP
-# ==========================================
-def scrape_zhihu_content(soup):
-    texts = []
-    script_tag = soup.find('script', id='js-initialData')
-    if script_tag and script_tag.string:
-        try:
-            data = json.loads(script_tag.string)
-            raw_contents = []
-            def extract(obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        if k == 'content' and isinstance(v, str) and len(v) > 20:
-                            raw_contents.append(v)
-                        else: extract(v)
-                elif isinstance(obj, list):
-                    for item in obj: extract(item)
-            extract(data)
-            for html in raw_contents:
-                texts.append(html_to_clean_text(BeautifulSoup(html, 'html.parser')))
-        except Exception:
-            pass
-    return "\n\n".join(texts) if texts else ""
-
-def scrape_any_page(url, custom_cookie=""):
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'zh-TW,zh-CN,zh;q=0.9,en;q=0.7',
-        }
         
-        cookie_val = custom_cookie.strip()
-        if cookie_val:
-            if cookie_val.startswith('[') and cookie_val.endswith(']'):
-                try:
-                    c_list = json.loads(cookie_val)
-                    cookie_val = "; ".join([f"{c['name']}={c['value']}" for c in c_list if 'name' in c and 'value' in c])
-                except Exception:
-                    pass
-            headers['Cookie'] = cookie_val
-
-        res = requests.get(url.strip(), headers=headers, timeout=15)
-        res.raise_for_status()
-
-        html_text = decode_chinese_text(res.content)
-        soup = BeautifulSoup(html_text, 'html.parser')
-
-        # Lấy tiêu đề
-        title_tag = soup.find(['h1', 'h2'])
-        title = title_tag.get_text().strip() if title_tag else ""
-        if not title and soup.title:
-            title = soup.title.string.strip()
-        title = re.sub(r'[\\/*?:"<>|]', "", title)[:60] or "Raw_Content"
-
-        # Phân loại website
-        if "zhihu.com" in url.lower():
-            content = scrape_zhihu_content(soup)
-            if not content:
-                clean_unwanted_elements(soup)
-                content = extract_smart_content(soup)
-        else:
-            clean_unwanted_elements(soup)
-            content = extract_smart_content(soup)
-
-        if not content or len(content.strip()) < 50:
-            return title, None, "Không bóc tách được nội dung chính (Trang có thể chặn bot hoặc nội dung quá ngắn)."
-            
-        return title, content, None
-
-    except Exception as e:
-        return "Lỗi", None, str(e)
+        # Nhận diện đường dẫn chương (chứa chapter, entry, .html hoặc có chữ '第' trong tên)
+        if re.search(r'(chapter|blog-entry|\.html|/n/|\d+)', href) or re.search(r'第.*?章|章|序|楔子', name):
+            full_url = urljoin(toc_url, href)
+            if not any(c['url'] == full_url for c in chapters):
+                chapters.append({'title': name, 'url': full_url})
+                
+    return chapters
 
 # ==========================================
-# GIAO DIỆN
+# 2. CÀO NỘI DUNG TỪNG CHƯƠNG
 # ==========================================
-st.title("🌐 Công Cụ Cào Raw Đa Năng (Auto Tách Cột Blog/FC2/Zhihu)")
-
-url_input = st.text_input("🔗 Nhập Link truyện (Hỗ trợ FC2, Blogspot, Zhihu, 69shu,...):")
-cookie_input = st.text_area("🍪 Cookie (Tùy chọn - Dành cho tài khoản VIP/Zhihu):", height=70)
-
-if st.button("⬇️ Cào Dữ Liệu", use_container_width=True, type="primary"):
-    if not url_input.strip():
-        st.warning("Vui lòng dán đường dẫn (URL) cần cào!")
-    else:
-        with st.spinner("Đang loại bỏ sidebar/menu và trích xuất nội dung..."):
-            title, content, err = scrape_any_page(url_input, cookie_input)
-            
-            if err:
-                st.error(f"❌ Cào thất bại: {err}")
-            else:
-                st.success("✅ Đã nhận biết và cào đúng cột nội dung!")
-                st.session_state['scraped_title'] = title
-                st.session_state['scraped_content'] = content
-
-if 'scraped_content' in st.session_state:
-    st.write("---")
-    title = st.session_state['scraped_title']
-    content = st.session_state['scraped_content']
+def scrape_chapter_body(url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+    res = requests.get(url, headers=headers, timeout=15)
+    res.raise_for_status()
+    soup = BeautifulSoup(decode_text(res.content), 'html.parser')
     
-    st.subheader(f"📄 {title}")
-    st.download_button(
-        label="💾 Tải Raw Xuống (.txt)",
-        data=content.encode('utf-8-sig'),
-        file_name=f"{title}.txt",
-        mime="text/plain",
-        use_container_width=True
-    )
-    st.text_area("Nội dung trích xuất:", content, height=450)
+    # Gỡ bỏ các thẻ rác
+    for tag in soup.find_all(['script', 'style', 'nav', 'aside', 'footer', 'header']):
+        tag.decompose()
+        
+    # Thẻ chứa nội dung czbooks / web truyện thông dụng
+    content_node = soup.select_one('.content, .chapter-detail, #chapter-c, .entry-body, #chapter-content, .read-content')
+    
+    if content_node:
+        return html_to_clean_text(content_node)
+        
+    # Dự phòng quét thẻ dài nhất
+    candidate_nodes = soup.find_all(['div', 'article'])
+    best_text = ""
+    for node in candidate_nodes:
+        txt = html_to_clean_text(node)
+        if len(txt) > len(best_text):
+            best_text = txt
+            
+    return best_text if len(best_text) > 80 else "Không tìm thấy nội dung văn bản."
+
+# ==========================================
+# GIAO DIỆN STREAMLIT
+# ==========================================
+st.title("📚 Cào Từng Chương Truyện Tự Động Vào Thư Mục")
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    url_toc = st.text_input("🔗 Đường dẫn trang mục lục (Ví dụ czbooks):", value="https://czbooks.net/n/sh300h")
+    save_folder = st.text_input("📁 Đường dẫn thư mục lưu trên máy tính:", value="./raw_truyen")
+with col2:
+    delay_time = st.number_input("⏱️ Giãn cách mỗi chương (giây):", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
+    limit_chapters = st.number_input("Giới hạn số chương cào (0 = toàn bộ):", min_value=0, value=0)
+
+if st.button("🚀 Bắt Đầu Quét & Cào Dữ Liệu", type="primary"):
+    if not url_toc:
+        st.warning("Vui lòng nhập link mục lục!")
+    else:
+        # Tạo thư mục nếu chưa tồn tại
+        os.makedirs(save_folder, exist_ok=True)
+        
+        with st.spinner("Đang phân tích danh sách chương..."):
+            try:
+                chapter_list = get_chapter_list(url_toc)
+            except Exception as e:
+                chapter_list = []
+                st.error(f"Lỗi đọc trang mục lục: {e}")
+        
+        if not chapter_list:
+            st.error("Không tìm thấy danh mục chương. Vui lòng kiểm tra lại link!")
+        else:
+            if limit_chapters > 0:
+                chapter_list = chapter_list[:limit_chapters]
+                
+            total = len(chapter_list)
+            st.info(f"Đã tìm thấy **{total}** chương. Bắt đầu tiến trình lưu file...")
+            
+            prog_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for index, chap in enumerate(chapter_list, start=1):
+                clean_title = clean_file_name(chap['title'])
+                # Đánh số thứ tự 4 chữ số (0001, 0002...) để tự sắp xếp đúng thứ tự trên máy tính
+                file_name = f"{index:04d}_{clean_title}.txt"
+                file_path = os.path.join(save_folder, file_name)
+                
+                status_text.text(f"[{index}/{total}] Đang cào: {chap['title']}")
+                
+                try:
+                    content = scrape_chapter_body(chap['url'])
+                    # Ghi ra file text định dạng UTF-8
+                    with open(file_path, "w", encoding="utf-8-sig") as f:
+                        f.write(f"{chap['title']}\n\n")
+                        f.write(content)
+                except Exception as e:
+                    with open(file_path, "w", encoding="utf-8-sig") as f:
+                        f.write(f"Lỗi khi cào chương: {e}")
+                
+                prog_bar.progress(index / total)
+                time.sleep(delay_time)
+                
+            st.success(f"🎉 Hoàn tất! Tất cả các chương đã được lưu tại: `{os.path.abspath(save_folder)}`")
